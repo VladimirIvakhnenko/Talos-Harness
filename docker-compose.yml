@@ -1,0 +1,97 @@
+services:
+
+  # ─── PostgreSQL 17 + pgvector ──────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: plc_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-plc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-plc_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-plc_agent}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-plc} -d ${POSTGRES_DB:-plc_agent}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Ollama (локальные LLM) ────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: plc_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # GPU: раскомментировать если есть NVIDIA GPU
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ─── Ollama model puller (запускается один раз) ────────────────────────────
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: plc_ollama_pull
+    restart: "no"
+    entrypoint: >
+      sh -c "
+        echo 'Waiting for Ollama...' &&
+        until curl -sf http://ollama:11434/api/tags; do sleep 3; done &&
+        echo 'Pulling qwen3.5:9b...' &&
+        OLLAMA_HOST=http://ollama:11434 ollama pull qwen3:9b &&
+        echo 'Model ready.'
+      "
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+
+  # ─── FastAPI приложение ────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: plc_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-plc}:${POSTGRES_PASSWORD:-plc_secret}@postgres:5432/${POSTGRES_DB:-plc_agent}
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - ./app:/app/app:ro
+      - ./benchmark:/app/benchmark:ro
+      - uploads_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  ollama_data:
+  uploads_data:
