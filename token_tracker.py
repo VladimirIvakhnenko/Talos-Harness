@@ -1,134 +1,71 @@
 """
 app/monitoring/token_tracker.py — LangChain callback для логирования токенов.
-
-Перехватывает каждый вызов LLM и записывает в token_usage.
-Поддерживает OpenRouter и Ollama.
 """
+from __future__ import annotations
+import asyncio
 import time
-import uuid
 from typing import Any
-
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
-
 from app.config import get_settings
-from app.database import AsyncSessionLocal
 
 settings = get_settings()
 
 
 class TokenUsageCallback(BaseCallbackHandler):
-    """
-    LangChain callback: перехватывает on_llm_start / on_llm_end,
-    вычисляет стоимость и записывает строку в token_usage.
-    """
-
-    def __init__(
-        self,
-        session_id: str | None = None,
-        agent_name: str = "unknown",
-        tool_name: str | None = None,
-        task_id: str | None = None,
-        react_step: str | None = None,
-    ):
+    def __init__(self, session_id=None, agent_name="unknown",
+                 tool_name=None, task_id=None, react_step=None):
         super().__init__()
-        self.session_id = session_id or str(uuid.uuid4())
+        self.session_id = session_id
         self.agent_name = agent_name
-        self.tool_name = tool_name
-        self.task_id = task_id
+        self.tool_name  = tool_name
+        self.task_id    = task_id
         self.react_step = react_step
-        self._start_time: float = 0.0
+        self._t0: float = 0.0
 
-    def on_llm_start(self, serialized: dict, prompts: list[str], **kwargs: Any) -> None:
-        self._start_time = time.perf_counter()
+    def on_llm_start(self, serialized, prompts, **kw):
+        self._t0 = time.perf_counter()
 
-    def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
-        latency_ms = int((time.perf_counter() - self._start_time) * 1000)
-
-        # Извлекаем токены из llm_output (OpenRouter / OpenAI формат)
-        usage = {}
+    def on_llm_end(self, response: LLMResult, **kw):
+        latency = int((time.perf_counter() - self._t0) * 1000)
+        usage   = {}
         if response.llm_output:
-            usage = response.llm_output.get("token_usage", {})
-            # Ollama возвращает чуть иначе
-            if not usage:
-                usage = response.llm_output.get("usage", {})
+            usage = (response.llm_output.get("token_usage")
+                     or response.llm_output.get("usage", {}))
 
-        prompt_tokens     = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        total_tokens      = usage.get("total_tokens", prompt_tokens + completion_tokens)
-
-        # Определяем модель
+        prompt_t = usage.get("prompt_tokens", 0)
+        comp_t   = usage.get("completion_tokens", 0)
+        total_t  = usage.get("total_tokens", prompt_t + comp_t)
         model_id = ""
         if response.llm_output:
-            model_id = response.llm_output.get("model_name", "")
-            if not model_id:
-                model_id = response.llm_output.get("model", "")
+            model_id = (response.llm_output.get("model_name")
+                        or response.llm_output.get("model", ""))
+        cost = settings.cost_usd(model_id, prompt_t, comp_t)
 
-        cost_usd = settings.cost_usd(model_id, prompt_tokens, completion_tokens)
-
-        # Асинхронная запись через синхронный вызов (callback синхронный)
-        import asyncio
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Уже в event loop — создаём задачу
-                loop.create_task(
-                    self._save_to_db(
-                        model_id, prompt_tokens, completion_tokens,
-                        total_tokens, cost_usd, latency_ms,
-                    )
-                )
+                loop.create_task(self._save(model_id, prompt_t, comp_t, total_t, cost, latency))
             else:
-                loop.run_until_complete(
-                    self._save_to_db(
-                        model_id, prompt_tokens, completion_tokens,
-                        total_tokens, cost_usd, latency_ms,
-                    )
-                )
-        except RuntimeError:
-            # Fallback: просто логируем
-            import logging
-            logging.getLogger(__name__).warning(
-                "TokenUsageCallback: cannot save to DB. "
-                f"tokens={total_tokens} cost=${cost_usd:.6f}"
-            )
+                loop.run_until_complete(self._save(model_id, prompt_t, comp_t, total_t, cost, latency))
+        except Exception:
+            pass
 
-    async def _save_to_db(
-        self,
-        model_id: str,
-        prompt_tokens: int,
-        completion_tokens: int,
-        total_tokens: int,
-        cost_usd: float,
-        latency_ms: int,
-    ) -> None:
-        """Записывает строку в token_usage."""
+    async def _save(self, model_id, prompt_t, comp_t, total_t, cost, latency):
         from sqlalchemy import text
-
+        from app.database import AsyncSessionLocal
         async with AsyncSessionLocal() as db:
-            await db.execute(
-                text("""
-                    INSERT INTO token_usage
-                        (session_id, agent_name, tool_name, model_id,
-                         prompt_tokens, completion_tokens, total_tokens,
-                         cost_usd, latency_ms, react_step, task_id)
-                    VALUES
-                        (:session_id, :agent_name, :tool_name, :model_id,
-                         :prompt_tokens, :completion_tokens, :total_tokens,
-                         :cost_usd, :latency_ms, :react_step, :task_id)
-                """),
-                {
-                    "session_id":         self.session_id,
-                    "agent_name":         self.agent_name,
-                    "tool_name":          self.tool_name,
-                    "model_id":           model_id,
-                    "prompt_tokens":      prompt_tokens,
-                    "completion_tokens":  completion_tokens,
-                    "total_tokens":       total_tokens,
-                    "cost_usd":           cost_usd,
-                    "latency_ms":         latency_ms,
-                    "react_step":         self.react_step,
-                    "task_id":            self.task_id,
-                },
-            )
+            await db.execute(text("""
+                INSERT INTO token_usage
+                    (session_id,agent_name,tool_name,model_id,
+                     prompt_tokens,completion_tokens,total_tokens,
+                     cost_usd,latency_ms,react_step,task_id)
+                VALUES
+                    (:sid,:agent,:tool,:model,
+                     :pt,:ct,:tt,:cost,:lat,:step,:task)
+            """), dict(
+                sid=self.session_id, agent=self.agent_name, tool=self.tool_name,
+                model=model_id, pt=prompt_t, ct=comp_t, tt=total_t,
+                cost=cost, lat=latency, step=self.react_step, task=self.task_id,
+            ))
             await db.commit()
