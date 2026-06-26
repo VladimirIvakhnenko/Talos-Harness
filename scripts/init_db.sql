@@ -1,16 +1,16 @@
-CREATE EXTENSION IF NOT EXISTS vector;
+﻿CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ── memories ──────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS memories (
     id              SERIAL PRIMARY KEY,
     content         TEXT NOT NULL,
-    embedding       vector(1536) NOT NULL,
+    embedding       vector(768) NOT NULL,
     metadata        JSONB NOT NULL DEFAULT '{}',
     parent_id       INTEGER REFERENCES memories(id) ON DELETE CASCADE,
     chunk_level     VARCHAR(10) NOT NULL DEFAULT 'single',
     doc_position    INTEGER,
-    embedding_model VARCHAR(50) DEFAULT 'text-embedding-3-small',
+    embedding_model VARCHAR(50) DEFAULT 'embeddinggemma-300m',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -19,7 +19,8 @@ ALTER TABLE memories
     ADD COLUMN IF NOT EXISTS tsvec tsvector
     GENERATED ALWAYS AS (to_tsvector('russian', content)) STORED;
 
-CREATE INDEX IF NOT EXISTS memories_hnsw  ON memories USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64);
+CREATE INDEX IF NOT EXISTS memories_hnsw ON memories
+    USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64);
 CREATE INDEX IF NOT EXISTS memories_gin   ON memories USING gin(tsvec);
 CREATE INDEX IF NOT EXISTS memories_type  ON memories ((metadata->>'type'));
 CREATE INDEX IF NOT EXISTS memories_sess  ON memories ((metadata->>'session_id'));

@@ -10,10 +10,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
+COPY ui/ ./ui/
 COPY benchmark/ ./benchmark/
 COPY scripts/ ./scripts/
 
 ENV PYTHONPATH=/app
+ENV GRADIO_SERVER_PORT=7860
 
-EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+EXPOSE 7860
+CMD ["python", "-m", "ui.gradio_app"]

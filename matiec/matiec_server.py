@@ -1,4 +1,4 @@
-"""
+﻿"""
 matiec_server.py — HTTP-обёртка над MatIEC (iec2c / iec2iec).
 
 Эндпоинты:
@@ -37,14 +37,20 @@ class CompileResult(BaseModel):
     stderr: str
 
 
+MATIEC_LIB = Path("/usr/local/lib/matiec")
+
+
 @app.get("/health")
 def health():
     iec2c_ok   = Path(IEC2C).exists()
     iec2iec_ok = Path(IEC2IEC).exists()
+    lib_ok     = MATIEC_LIB.is_dir() and any(MATIEC_LIB.iterdir())
+    ok         = iec2c_ok and iec2iec_ok and lib_ok
     return {
-        "status": "ok" if (iec2c_ok or iec2iec_ok) else "degraded",
-        "iec2c":   iec2c_ok,
+        "status": "ok" if ok else "degraded",
+        "iec2c": iec2c_ok,
         "iec2iec": iec2iec_ok,
+        "lib_ok": lib_ok,
     }
 
 

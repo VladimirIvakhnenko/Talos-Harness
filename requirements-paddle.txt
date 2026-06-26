@@ -1,0 +1,4 @@
+﻿# Optional: only when OCR_BACKEND=paddle (local or custom Docker build)
+paddlepaddle==3.2.1
+paddleocr>=3.6.0,<4
+opencv-python-headless>=4.8,<5

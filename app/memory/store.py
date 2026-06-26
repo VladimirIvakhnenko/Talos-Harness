@@ -1,23 +1,48 @@
-"""
+﻿"""
 app/memory/store.py — Векторная память: dense + sparse + RRF + parent-child.
 """
 from __future__ import annotations
+import json
 from typing import Any, Literal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
+
+settings = get_settings()
+
 MemType  = Literal["doc", "chat", "fact", "skill"]
 ChunkLvl = Literal["child", "parent", "single"]
+
+
+def _embedding_expr(column: str = "embedding") -> str:
+    """pgvector HNSW indexes support up to 2000 dims; use halfvec cast above that."""
+    dims = settings.embedding_dimensions
+    if dims > 2000:
+        return f"({column}::halfvec({dims}))"
+    return column
+
+
+def _query_embedding_cast() -> str:
+    dims = settings.embedding_dimensions
+    if dims > 2000:
+        return f"CAST(:emb AS halfvec({dims}))"
+    return "CAST(:emb AS vector)"
 
 
 async def add_memory(db: AsyncSession, content: str, embedding: list[float],
                      metadata: dict, chunk_level: ChunkLvl = "single",
                      parent_id: int | None = None) -> int:
     r = await db.execute(text("""
-        INSERT INTO memories (content,embedding,metadata,chunk_level,parent_id)
-        VALUES (:c,:e,:m,:l,:p) RETURNING id
-    """), {"c": content, "e": str(embedding), "m": metadata,
-           "l": chunk_level, "p": parent_id})
+        INSERT INTO memories (content, embedding, metadata, chunk_level, parent_id)
+        VALUES (:c, CAST(:e AS vector), CAST(:m AS jsonb), :l, :p) RETURNING id
+    """), {
+        "c": content,
+        "e": str(embedding),
+        "m": json.dumps(metadata),
+        "l": chunk_level,
+        "p": parent_id,
+    })
     await db.commit()
     return r.scalar_one()
 
@@ -48,11 +73,13 @@ async def dense_search(db: AsyncSession, emb: list[float], top_k: int = 20,
         conds.append("metadata->>'session_id' = :sid"); params["sid"] = session_id
     if chunk_level:
         conds.append("chunk_level = :lvl"); params["lvl"] = chunk_level
+    emb_expr = _embedding_expr()
+    emb_cast = _query_embedding_cast()
     rows = await db.execute(text(f"""
         SELECT id,content,metadata,chunk_level,parent_id,
-               1-(embedding<=>:emb::vector) AS score
+               1-({emb_expr} <=> {emb_cast}) AS score
         FROM memories WHERE {" AND ".join(conds)}
-        ORDER BY embedding<=>:emb::vector LIMIT :top_k
+        ORDER BY {emb_expr} <=> {emb_cast} LIMIT :top_k
     """), params)
     return [dict(r._mapping) for r in rows.fetchall()]
 
