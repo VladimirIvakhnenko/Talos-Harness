@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from app.api.routes import agent, benchmark, documents, memory, monitoring, system
+from app.api.routes import agent, benchmark, documents, memory, monitoring, sessions, system
 from app.database import get_db
 
 APP_DESCRIPTION = """
@@ -20,7 +20,7 @@ APP_DESCRIPTION = """
 **Архитектура:** Planner (Nex-N2-Pro) → Engineer (Qwen3.5-9B) → Retriever (Qwen3.5-4B)  
 **Провайдер LLM:** OpenRouter (все модели)  
 **Верификация:** MatIEC (iec2c / iec2iec)  
-**Память:** PostgreSQL 17 + pgvector (dense + sparse + RRF)  
+**Память:** PostgreSQL 17 + pgvector (dense RAG, сессии чатов)  
 **Бенчмарк:** Agents4PLC v2.0 (96 задач)
 
 ### Сценарии:
@@ -55,4 +55,5 @@ app.include_router(documents.router)
 app.include_router(agent.router)
 app.include_router(benchmark.router)
 app.include_router(memory.router)
+app.include_router(sessions.router)
 app.include_router(monitoring.router)

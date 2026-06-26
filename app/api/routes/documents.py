@@ -1,5 +1,6 @@
 ﻿import uuid
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
@@ -18,6 +19,7 @@ _DOCUMENT_SUFFIXES = {".pdf", ".md", ".txt"}
 async def upload_document(
     file: UploadFile = File(..., description="PDF, Markdown или текстовый файл"),
     doc_type: str = Query("general", description="iec_standard | elbrus_manual | tz | general"),
+    session_id: Optional[str] = Query(None, description="UUID чата — привязать doc к сессии"),
 ):
     if not file.filename:
         raise HTTPException(400, "Filename is required")
@@ -28,6 +30,8 @@ async def upload_document(
     path = UPLOAD_DIR / f"{uuid.uuid4()}_{file.filename}"
     path.write_bytes(await file.read())
 
+    scope = "session" if session_id else "global"
+
     async with get_db() as db:
         if suffix == ".pdf":
             result = await process_pdf(
@@ -35,6 +39,8 @@ async def upload_document(
                 doc_type=doc_type,
                 source_name=file.filename,
                 db=db,
+                session_id=session_id,
+                scope=scope,
             )
             pipeline = f"pdf2image → {ocr_backend_label()} → parent-child chunking → pgvector"
         else:
@@ -43,6 +49,8 @@ async def upload_document(
                 doc_type=doc_type,
                 source_name=file.filename,
                 db=db,
+                session_id=session_id,
+                scope=scope,
             )
             pipeline = "read → parent-child chunking → pgvector"
 
@@ -51,6 +59,8 @@ async def upload_document(
         "filename": file.filename,
         "format": suffix.lstrip("."),
         "doc_type": doc_type,
+        "scope": scope,
+        "session_id": session_id,
         "path": str(path),
         "pages": result["pages"],
         "chunks": result["chunks"],
@@ -63,11 +73,14 @@ async def upload_document(
 async def upload_pdf(
     file: UploadFile = File(..., description="PDF файл"),
     doc_type: str = Query("general", description="iec_standard | elbrus_manual | tz | general"),
+    session_id: Optional[str] = Query(None, description="UUID чата — привязать doc к сессии"),
 ):
     if not file.filename or not file.filename.endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted")
     path = UPLOAD_DIR / f"{uuid.uuid4()}_{file.filename}"
     path.write_bytes(await file.read())
+
+    scope = "session" if session_id else "global"
 
     async with get_db() as db:
         result = await process_pdf(
@@ -75,12 +88,16 @@ async def upload_pdf(
             doc_type=doc_type,
             source_name=file.filename,
             db=db,
+            session_id=session_id,
+            scope=scope,
         )
 
     return {
         "status": "processed",
         "filename": file.filename,
         "doc_type": doc_type,
+        "scope": scope,
+        "session_id": session_id,
         "path": str(path),
         "pages": result["pages"],
         "chunks": result["chunks"],

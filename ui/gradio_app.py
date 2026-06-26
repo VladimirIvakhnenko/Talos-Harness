@@ -1,19 +1,21 @@
 ﻿"""
-ui/gradio_app.py — минималистичный Gradio UI: чат-агент + вложение файла.
+ui/gradio_app.py — Gradio UI: список чатов + чат-агент + вложение файла.
 
 Запуск: python -m ui.gradio_app
 """
 from __future__ import annotations
 
 import os
-import uuid
 from pathlib import Path
 
 import gradio as gr
 
-from app.agents.react_agent import stream_agent
+from app.agents.llm_client import embed_single
+from app.agents.react_agent import persist_text_from_agent_log, stream_agent
 from app.api.deps import UPLOAD_DIR
 from app.database import get_db
+from app.memory.sessions import create_session, ensure_session, list_sessions, rename_session, touch_session
+from app.memory.store import load_chat_history, next_turn_index, save_chat_message
 from app.tools.pdf_processor import stream_process_pdf
 from app.tools.signal_parser import parse_signal_table, signals_to_st_var
 from app.tools.text_processor import stream_process_text_file
@@ -30,6 +32,10 @@ def _file_path(file) -> str | None:
     if path and Path(path).exists():
         return path
     return None
+
+
+def _session_choices(sessions: list[dict]) -> list[tuple[str, str]]:
+    return [(s.get("title") or "Без названия", s["id"]) for s in sessions]
 
 
 def _format_doc_event(ev: dict) -> str:
@@ -66,6 +72,8 @@ async def _ingest_non_pdf(path: str) -> str:
         code = Path(path).read_text(encoding="utf-8", errors="replace")
         return f"[ST-файл «{name}»]\n{code[:8000]}"
 
+    import uuid
+
     dest = UPLOAD_DIR / f"{uuid.uuid4()}_{name}"
     dest.write_bytes(Path(path).read_bytes())
     return f"[Файл «{name}» сохранён]"
@@ -83,31 +91,37 @@ def _assistant_content(ingest_log: list[str], agent_log: str) -> str:
 
 
 def _patch_assistant(history: list, content: str) -> list:
-    """Новая копия history — Gradio надёжнее обновляет чат без мутации на месте."""
     out = [dict(m) for m in history]
     out[-1] = {**out[-1], "content": content}
     return out
 
 
-def _prior_user_messages(history: list) -> list[str]:
-    """Все предыдущие реплики пользователя целиком (без текущего хода)."""
-    return [
-        m.get("content") or ""
-        for m in history[:-2]
-        if m.get("role") == "user"
-    ]
+async def init_ui():
+    async with get_db() as db:
+        sessions = await list_sessions(db, limit=50)
+        if not sessions:
+            sid = await create_session(db)
+            sessions = await list_sessions(db, limit=50)
+        else:
+            sid = sessions[0]["id"]
+        history = await load_chat_history(db, sid)
+    choices = _session_choices(sessions)
+    return gr.update(choices=choices, value=sid), sid, history
 
 
-def _build_task_context(prior_user_messages: list[str], context_parts: list[str]) -> str:
-    sections: list[str] = []
-    if prior_user_messages:
-        sections.append(
-            "[Предыдущие сообщения пользователя]\n"
-            + "\n---\n\n".join(prior_user_messages)
-        )
-    if context_parts:
-        sections.append("[Контекст задачи]\n" + "\n\n".join(context_parts))
-    return "\n\n".join(sections)
+async def switch_chat(session_id: str):
+    if not session_id:
+        return [], ""
+    async with get_db() as db:
+        history = await load_chat_history(db, session_id)
+    return history, session_id
+
+
+async def new_chat():
+    async with get_db() as db:
+        sid = await create_session(db)
+        sessions = await list_sessions(db, limit=50)
+    return gr.update(choices=_session_choices(sessions), value=sid), sid, []
 
 
 async def chat_fn(message: str, file, history: list, session_id: str):
@@ -117,14 +131,16 @@ async def chat_fn(message: str, file, history: list, session_id: str):
         return
 
     history = list(history or [])
-    sid = session_id or str(uuid.uuid4())
     ingest_log: list[str] = []
     context_parts: list[str] = []
-    prior_msgs = _prior_user_messages(history)
+    agent_log = ""
+
+    async with get_db() as db:
+        sid = await ensure_session(db, session_id or None)
 
     history.append({"role": "user", "content": user_display})
     history.append({"role": "assistant", "content": "⏳ Обработка…"})
-    yield history, sid, None
+    yield history, sid, None, gr.update()
 
     try:
         if path:
@@ -134,9 +150,23 @@ async def chat_fn(message: str, file, history: list, session_id: str):
             if suffix in (".pdf", ".md", ".txt"):
                 async with get_db() as db:
                     stream = (
-                        stream_process_pdf(path, doc_type="general", source_name=name, db=db)
+                        stream_process_pdf(
+                            path,
+                            doc_type="general",
+                            source_name=name,
+                            db=db,
+                            session_id=sid,
+                            scope="session",
+                        )
                         if suffix == ".pdf"
-                        else stream_process_text_file(path, doc_type="general", source_name=name, db=db)
+                        else stream_process_text_file(
+                            path,
+                            doc_type="general",
+                            source_name=name,
+                            db=db,
+                            session_id=sid,
+                            scope="session",
+                        )
                     )
                     async for ev in stream:
                         line = _format_doc_event(ev)
@@ -149,7 +179,7 @@ async def chat_fn(message: str, file, history: list, session_id: str):
                                 else ""
                             )
                             context_parts.append(
-                                f"[Документ «{name}» в памяти: "
+                                f"[Документ «{name}» в памяти чата: "
                                 f"{pages_note}{r.get('chunks', 0)} фрагментов]"
                             )
                         else:
@@ -157,7 +187,7 @@ async def chat_fn(message: str, file, history: list, session_id: str):
                         history = _patch_assistant(
                             history, _assistant_content(ingest_log, "")
                         )
-                        yield history, sid, None
+                        yield history, sid, None, gr.update()
             else:
                 ctx = await _ingest_non_pdf(path)
                 ingest_log = [f"**Файл** {ctx[:500]}{'…' if len(ctx) > 500 else ''}"]
@@ -165,35 +195,48 @@ async def chat_fn(message: str, file, history: list, session_id: str):
                 history = _patch_assistant(
                     history, _assistant_content(ingest_log, "")
                 )
-                yield history, sid, None
+                yield history, sid, None, gr.update()
 
-        task_context = _build_task_context(prior_msgs, context_parts)
+        task_context = "\n\n".join(context_parts) if context_parts else None
 
         history = _patch_assistant(
             history, _assistant_content(ingest_log, "**Агент** запуск…")
         )
-        yield history, sid, None
+        yield history, sid, None, gr.update()
 
         async for agent_partial in stream_agent(
             message,
             session_id=sid,
-            context=task_context or None,
+            context=task_context,
         ):
+            agent_log = agent_partial
             history = _patch_assistant(
                 history, _assistant_content(ingest_log, agent_partial)
             )
-            yield history, sid, None
+            yield history, sid, None, gr.update()
+
+        persisted = persist_text_from_agent_log(agent_log) if agent_log else "Готово."
+        async with get_db() as db:
+            ti = await next_turn_index(db, sid)
+            emb_u = await embed_single(user_display)
+            await save_chat_message(db, sid, "user", user_display, emb_u, ti)
+            emb_a = await embed_single(persisted[:4000] or " ")
+            await save_chat_message(db, sid, "assistant", persisted, emb_a, ti)
+            await touch_session(db, sid)
+            if ti == 0 and message.strip():
+                await rename_session(db, sid, message.strip()[:60])
+            sessions = await list_sessions(db, limit=50)
+
+        yield history, sid, None, gr.update(
+            choices=_session_choices(sessions), value=sid
+        )
 
     except Exception as e:
         history = _patch_assistant(
             history,
             _assistant_content(ingest_log, f"**Ошибка:** {type(e).__name__}: {e}"),
         )
-        yield history, sid, None
-
-
-def clear_chat():
-    return [], "", None
+        yield history, sid, None, gr.update()
 
 
 def build_ui() -> gr.Blocks:
@@ -201,41 +244,59 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("# Talos Harness\nГенерация ST-кода для ПЛК")
 
         session_state = gr.State("")
-        chatbot = gr.Chatbot(
-            label="Чат",
-            height=480,
-            show_copy_button=True,
-            type="messages",
-            render_markdown=True,
-            sanitize_html=False,
-        )
 
         with gr.Row():
-            msg_input = gr.Textbox(
-                placeholder="Опишите задачу или прикрепите файл…",
-                show_label=False,
-                scale=4,
-                container=False,
-            )
-            file_input = gr.File(
-                label="Файл",
-                file_types=[".pdf", ".md", ".txt", ".csv", ".xlsx", ".xls", ".st"],
-                scale=1,
-                type="filepath",
-            )
+            with gr.Column(scale=1, min_width=200):
+                chat_list = gr.Radio(
+                    label="Чаты",
+                    choices=[],
+                    interactive=True,
+                )
+                new_chat_btn = gr.Button("+ Новый чат", variant="secondary")
 
-        with gr.Row():
-            send_btn = gr.Button("Отправить", variant="primary")
-            clear_btn = gr.Button("Очистить")
+            with gr.Column(scale=4):
+                chatbot = gr.Chatbot(
+                    label="Чат",
+                    height=480,
+                    show_copy_button=True,
+                    type="messages",
+                    render_markdown=True,
+                    sanitize_html=False,
+                )
 
-        outputs = [chatbot, session_state, file_input]
-        inputs = [msg_input, file_input, chatbot, session_state]
+                with gr.Row():
+                    msg_input = gr.Textbox(
+                        placeholder="Опишите задачу или прикрепите файл…",
+                        show_label=False,
+                        scale=4,
+                        container=False,
+                    )
+                    file_input = gr.File(
+                        label="Файл",
+                        file_types=[".pdf", ".md", ".txt", ".csv", ".xlsx", ".xls", ".st"],
+                        scale=1,
+                        type="filepath",
+                    )
 
-        send_btn.click(chat_fn, inputs, outputs).then(lambda: "", outputs=msg_input)
-        msg_input.submit(chat_fn, inputs, outputs).then(lambda: "", outputs=msg_input)
-        clear_btn.click(clear_chat, outputs=[chatbot, session_state, file_input])
+                with gr.Row():
+                    send_btn = gr.Button("Отправить", variant="primary")
 
         gr.Markdown(f"_{_FILE_HINT}_")
+
+        demo.load(init_ui, outputs=[chat_list, session_state, chatbot])
+
+        chat_outputs = [chatbot, session_state, file_input, chat_list]
+        chat_inputs = [msg_input, file_input, chatbot, session_state]
+
+        send_btn.click(chat_fn, chat_inputs, chat_outputs).then(
+            lambda: "", outputs=msg_input
+        )
+        msg_input.submit(chat_fn, chat_inputs, chat_outputs).then(
+            lambda: "", outputs=msg_input
+        )
+
+        chat_list.change(switch_chat, inputs=[chat_list], outputs=[chatbot, session_state])
+        new_chat_btn.click(new_chat, outputs=[chat_list, session_state, chatbot])
 
     return demo
 

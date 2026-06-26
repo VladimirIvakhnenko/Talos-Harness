@@ -26,10 +26,17 @@ CREATE INDEX IF NOT EXISTS memories_type  ON memories ((metadata->>'type'));
 CREATE INDEX IF NOT EXISTS memories_sess  ON memories ((metadata->>'session_id'));
 CREATE INDEX IF NOT EXISTS memories_lvl   ON memories (chunk_level);
 CREATE INDEX IF NOT EXISTS memories_par   ON memories (parent_id);
+CREATE INDEX IF NOT EXISTS memories_doc_source
+    ON memories ((metadata->>'type'), (metadata->>'scope'), (metadata->>'session_id'), (metadata->>'source'))
+    WHERE metadata->>'type' = 'doc';
+CREATE INDEX IF NOT EXISTS memories_chat_session
+    ON memories ((metadata->>'session_id'), created_at)
+    WHERE metadata->>'type' = 'chat';
 
 -- ── sessions ──────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS sessions (
     id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title      TEXT NOT NULL DEFAULT 'Новый чат',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metadata   JSONB NOT NULL DEFAULT '{}'

@@ -8,9 +8,12 @@ class Settings(BaseSettings):
     # PostgreSQL
     database_url: str = "postgresql+asyncpg://plc:plc_secret@localhost:5432/plc_agent"
 
-    # OpenRouter — PRIMARY provider
+    # LLM provider: openrouter | lmstudio
+    llm_backend: str = "openrouter"
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    lmstudio_base_url: str = "http://localhost:1234/v1"
+    lmstudio_api_key: str = "lm-studio"
 
     # Models
     planner_model: str   = "qwen/qwen3.6-27b"
@@ -28,6 +31,7 @@ class Settings(BaseSettings):
 
     # Agent (context_limit = input + output; max_tokens is output only)
     agent_max_iterations: int = 10
+    expert_max_iterations: int = 5
     agent_context_limit: int = 131_072
     agent_input_reserve: int = 16_384
     agent_max_tokens: int = 120_000
@@ -63,6 +67,16 @@ class Settings(BaseSettings):
     def cost_usd(self, model_id: str, prompt_t: int, comp_t: int) -> float:
         p = self.model_pricing.get(model_id, {"input": 0.5, "output": 1.5})
         return prompt_t * p["input"] / 1_000_000 + comp_t * p["output"] / 1_000_000
+
+    def llm_api_base(self) -> str:
+        if self.llm_backend.lower() == "lmstudio":
+            return self.lmstudio_base_url
+        return self.openrouter_base_url
+
+    def llm_api_key(self) -> str:
+        if self.llm_backend.lower() == "lmstudio":
+            return self.lmstudio_api_key
+        return self.openrouter_api_key
 
     def completion_token_limit(self) -> int:
         """Бюджет на ответ: context_limit − резерв под промпт/инструменты."""

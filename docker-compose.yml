@@ -72,6 +72,8 @@
       dockerfile: Dockerfile
     container_name: plc_api
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     dns:
       - 127.0.0.11
       - 8.8.8.8
@@ -91,6 +93,7 @@
       EMBEDDING_MAX_CHARS: "1500"
       EMBEDDING_GGUF_FILE: ${EMBEDDING_GGUF_FILE:-embeddinggemma-300M-Q8_0.gguf}
       LLAMA_EMBEDDING_URL: http://llama-embedding:8080
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
     volumes:
       - uploads_data:/app/uploads
       - ./app:/app/app
@@ -115,6 +118,8 @@
       dockerfile: Dockerfile.ui
     container_name: plc_ui
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     dns:
       - 127.0.0.11
       - 8.8.8.8
@@ -136,6 +141,7 @@
       EMBEDDING_DIMENSIONS: "768"
       EMBEDDING_MAX_CHARS: "1500"
       LLAMA_EMBEDDING_URL: http://llama-embedding:8080
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
     volumes:
       - uploads_data:/app/uploads
       - ./app:/app/app

@@ -32,18 +32,29 @@ async def health():
     except Exception as e:
         checks["matiec"] = f"error: {e}"
 
-    if settings.openrouter_api_key and settings.openrouter_api_key != "sk-or-v1-REPLACE_ME":
+    if settings.llm_backend.lower() == "lmstudio":
+        try:
+            base = settings.lmstudio_base_url.rstrip("/")
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(
+                    f"{base}/models",
+                    headers={"Authorization": f"Bearer {settings.lmstudio_api_key}"},
+                )
+                checks["llm"] = "ok (lmstudio)" if r.status_code == 200 else f"http {r.status_code}"
+        except Exception as e:
+            checks["llm"] = f"error: {e}"
+    elif settings.openrouter_api_key and settings.openrouter_api_key != "sk-or-v1-REPLACE_ME":
         try:
             async with httpx.AsyncClient(timeout=5) as c:
                 r = await c.get(
                     "https://openrouter.ai/api/v1/models",
                     headers={"Authorization": f"Bearer {settings.openrouter_api_key}"},
                 )
-                checks["openrouter"] = "ok" if r.status_code == 200 else f"http {r.status_code}"
+                checks["llm"] = "ok (openrouter)" if r.status_code == 200 else f"http {r.status_code}"
         except Exception as e:
-            checks["openrouter"] = f"error: {e}"
+            checks["llm"] = f"error: {e}"
     else:
-        checks["openrouter"] = "no api key"
+        checks["llm"] = "no api key"
 
     if settings.embedding_backend.lower() == "local":
         try:

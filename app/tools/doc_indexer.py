@@ -3,12 +3,14 @@ app/tools/doc_indexer.py — чанкинг и индексация текста
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from app.agents.llm_client import embed_texts
 from app.config import get_settings
 
 settings = get_settings()
+
+DocScope = Literal["global", "session"]
 
 
 def recursive_chunk(text: str, size: int = 1000, overlap: int = 200) -> list[str]:
@@ -44,6 +46,8 @@ async def stream_index_text(
     source_name: str = "",
     db=None,
     pages: int = 1,
+    session_id: str | None = None,
+    scope: DocScope = "global",
 ) -> AsyncIterator[dict[str, Any]]:
     """Индексация текста: chunk → embed → pgvector."""
     if db is None:
@@ -51,6 +55,10 @@ async def stream_index_text(
         result = {"pages": pages, "chunks": len(chunks), "chunk_ids": []}
         yield {"phase": "done", "result": result}
         return
+
+    from app.memory.store import add_parent_child, delete_document
+
+    await delete_document(db, source_name, scope, session_id)
 
     parent_chunks = recursive_chunk(full_text, 1500, 150)
     total_parents = len([p for p in parent_chunks if p.strip()])
@@ -79,14 +87,15 @@ async def stream_index_text(
             for ci, (t, e) in enumerate(zip(child_texts, child_embs))
         ]
 
-        meta = {
+        meta: dict[str, Any] = {
             "type": "doc",
+            "scope": scope,
             "doc_type": doc_type,
             "source": source_name,
             "parent_index": pi,
         }
-
-        from app.memory.store import add_parent_child
+        if scope == "session" and session_id:
+            meta["session_id"] = session_id
 
         _, cids = await add_parent_child(db, parent_text, parent_emb, children, meta)
         chunk_ids.extend(cids)
@@ -111,11 +120,19 @@ async def index_text(
     source_name: str = "",
     db=None,
     pages: int = 1,
+    session_id: str | None = None,
+    scope: DocScope = "global",
 ) -> dict:
     """Блокирующая обёртка над stream_index_text."""
     result: dict = {"pages": pages, "chunks": 0, "chunk_ids": []}
     async for ev in stream_index_text(
-        full_text, doc_type, source_name or "document", db, pages=pages
+        full_text,
+        doc_type,
+        source_name or "document",
+        db,
+        pages=pages,
+        session_id=session_id,
+        scope=scope,
     ):
         if ev.get("phase") == "done":
             result = ev["result"]

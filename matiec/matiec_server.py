@@ -80,7 +80,7 @@ def _run_matiec(req: CompileRequest, mode: str) -> CompileResult:
     st_file.write_text(req.code, encoding="utf-8")
 
     if mode == "validate" and Path(IEC2IEC).exists():
-        cmd = [IEC2IEC, str(st_file)]
+        cmd = [IEC2IEC, "-I", str(MATIEC_LIB) + "/", str(st_file)]
     elif Path(IEC2C).exists():
         out_dir = work / "c_out"
         out_dir.mkdir(exist_ok=True)

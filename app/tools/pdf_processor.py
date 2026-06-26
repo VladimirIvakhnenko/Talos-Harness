@@ -21,6 +21,8 @@ async def stream_process_pdf(
     doc_type: str = "general",
     source_name: str = "",
     db=None,
+    session_id: str | None = None,
+    scope: str = "global",
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Потоковая обработка PDF с событиями прогресса.
@@ -51,7 +53,8 @@ async def stream_process_pdf(
     name = source_name or Path(pdf_path).name
 
     async for ev in stream_index_text(
-        full_text, doc_type, name, db, pages=total_pages
+        full_text, doc_type, name, db, pages=total_pages,
+        session_id=session_id, scope=scope,
     ):
         yield ev
 
@@ -61,10 +64,14 @@ async def process_pdf(
     doc_type: str = "general",
     source_name: str = "",
     db=None,
+    session_id: str | None = None,
+    scope: str = "global",
 ) -> dict:
     """Полный пайплайн обработки PDF (блокирующая обёртка над stream_process_pdf)."""
     result: dict = {"pages": 0, "chunks": 0, "chunk_ids": []}
-    async for ev in stream_process_pdf(pdf_path, doc_type, source_name, db):
+    async for ev in stream_process_pdf(
+        pdf_path, doc_type, source_name, db, session_id=session_id, scope=scope
+    ):
         if ev.get("phase") == "done":
             result = ev["result"]
     return result

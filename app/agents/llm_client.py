@@ -1,8 +1,10 @@
 ﻿"""
-app/agents/llm_client.py — LLM через OpenRouter (primary, единственный провайдер).
+app/agents/llm_client.py — LLM через OpenRouter или LM Studio (OpenAI-compatible API).
 """
 from __future__ import annotations
+
 from langchain_openai import ChatOpenAI
+
 from app.config import get_settings
 from app.monitoring.token_tracker import TokenUsageCallback
 
@@ -23,7 +25,7 @@ def get_llm(
     react_step: str | None = None,
     temperature: float | None = None,
 ):
-    """Фабрика LLM через OpenRouter с прикреплённым TokenUsageCallback."""
+    """Фабрика LLM (OpenRouter или LM Studio) с TokenUsageCallback."""
     cb = TokenUsageCallback(
         session_id=session_id,
         agent_name=role,
@@ -31,22 +33,24 @@ def get_llm(
         task_id=task_id,
         react_step=react_step,
     )
-    return ChatOpenAI(
-        model=_MODEL_MAP.get(role, settings.engineer_model),
-        openai_api_key=settings.openrouter_api_key,
-        openai_api_base=settings.openrouter_base_url,
-        temperature=temperature if temperature is not None else settings.agent_temperature,
-        max_tokens=settings.completion_token_limit(),
-        callbacks=[cb],
-        default_headers={
+    kwargs: dict = {
+        "model": _MODEL_MAP.get(role, settings.engineer_model),
+        "openai_api_key": settings.llm_api_key(),
+        "openai_api_base": settings.llm_api_base(),
+        "temperature": temperature if temperature is not None else settings.agent_temperature,
+        "max_tokens": settings.completion_token_limit(),
+        "callbacks": [cb],
+    }
+    if settings.llm_backend.lower() != "lmstudio":
+        kwargs["default_headers"] = {
             "HTTP-Referer": "https://github.com/talos-harness",
             "X-Title":      "Talos Harness PLC Agent",
-        },
-    )
+        }
+    return ChatOpenAI(**kwargs)
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Батчевая векторизация: локально (sentence-transformers) или OpenRouter."""
+    """Батчевая векторизация: локально (llama.cpp) или OpenRouter."""
     if settings.embedding_backend.lower() == "local":
         from app.tools.local_embedder import encode_texts as local_encode_texts
         return await local_encode_texts(texts)
