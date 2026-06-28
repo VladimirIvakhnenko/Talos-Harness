@@ -75,7 +75,8 @@ User Query
 2. **PLCopen XML** — экспорт схем для обмена с CODESYS и совместимыми средами.
 3. **Валидация и исправление** — MatIEC находит ошибки, Expert перегенерирует код (до лимита итераций).
 4. **Модуль по таблице сигналов** — CSV/XLSX → VAR-секция и каркас PROGRAM.
-5. **Бенчмарк Agents4PLC** (опционально) — прогон задач через `benchmark/runner.py`.
+5. **Бенчмарк ST coding** — 10 промышленных задач IEC 61131-3, три режима (baseline / agent / RAG+чат), метрики MatIEC и RAG — см. [ST coding benchmark](#st-coding-benchmark).
+6. **Бенчмарк Agents4PLC** (опционально) — прогон задач через `benchmark/runner.py`.
 
 ## Быстрый старт
 
@@ -124,6 +125,8 @@ AGENT_MAX_TOKENS=8192
 | `LLAMA_EMBEDDING_URL` | Docker: `http://llama-embedding:8080` |
 | `EXPERT_MAX_ITERATIONS` | Лимит шагов ReAct Expert (default 5) |
 | `TOP_K_RETRIEVAL` | Число фрагментов в Retrieval |
+| `BENCHMARK_MAX_VALIDATION_ATTEMPTS` | Лимит `validate_st_syntax` в ST coding bench (default 2) |
+| `BENCHMARK_ST_GUIDE_PATH` | MD-гайд для RAG в бенчмарке |
 
 Полный список — в [`.env.example`](.env.example).
 
@@ -131,6 +134,7 @@ AGENT_MAX_TOKENS=8192
 
 ```bash
 docker exec -i plc_postgres psql -U plc -d plc_agent < scripts/migrate_memory_sessions.sql
+docker exec -i plc_postgres psql -U plc -d plc_agent < scripts/migrate_benchmark_metrics.sql
 ```
 
 ## Использование
@@ -181,6 +185,56 @@ curl -X POST http://localhost:8000/benchmark/run \
   -d '{"subset":"medium","n_tasks":10,"configs":["baseline","full_agent"]}'
 ```
 
+### ST coding benchmark
+
+Набор из 10 задач промышленной автоматизации (`benchmark/st_coding_bench.json`, IA01–IA10). Один запуск = **одна config × n задач**. Полное сравнение трёх режимов — три отдельных прогона.
+
+| Config | Описание |
+|--------|----------|
+| `baseline` | LLM + `ENGINEER_PROMPT`, без агента и RAG; новая session на задачу; MatIEC только post-hoc для метрики |
+| `agent_isolated` | ReAct + MatIEC; **новая session на задачу**; RAG по **global**-индексу ST-гайда |
+| `agent_single_session` | ReAct + MatIEC; **один чат** на все задачи; session-scoped гайд; история (последние 5 сообщений) в retrieval |
+
+**Метрики:** `compilation_ok` (accuracy через MatIEC), `pass_at_1`, latency, tokens/cost, `validation_attempts`, RAG (`guide_hit_rate`, `retrieval_top1_score`). Результаты — в `benchmark_results` и JSON `benchmark/st_coding_run_<config>.json`.
+
+**Запуск (Docker):**
+
+```bash
+docker exec plc_api python /app/benchmark/run_full_bench.py --config baseline
+docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_isolated
+docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_single_session
+```
+
+**Продолжение прерванного прогона:**
+
+```bash
+# single-session: тот же чат и run_id, пропуск выполненных задач
+docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_single_session --resume
+
+# isolated: явно с нужной задачи (у каждой задачи свой session_id)
+docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_isolated \
+  --resume --start-task IA09 --run-id <uuid-прогона>
+```
+
+**Экспорт полного JSON из БД** (после нескольких resume-пакетов):
+
+```bash
+docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_single_session \
+  --export-run-id <uuid-прогона>
+```
+
+**API:**
+
+```bash
+curl -X POST http://localhost:8000/benchmark/st_coding/run \
+  -H "Content-Type: application/json" \
+  -d '{"config":"agent_isolated","n_tasks":10,"max_validation_attempts":2}'
+
+curl http://localhost:8000/benchmark/results
+```
+
+ST-гайд для RAG: [`benchmark/assets/IEC-61131-3-ST-GUIDE.md`](benchmark/assets/IEC-61131-3-ST-GUIDE.md).
+
 ## MatIEC
 
 Сборка образа (форк [sm1820/matiec](https://github.com/sm1820/matiec)):
@@ -228,8 +282,8 @@ app/
   prompts/     — системные промпты
   tools/       — MatIEC, PDF/OCR, индексация документов
 ui/            — Gradio (список чатов + агент)
-benchmark/     — Agents4PLC runner
-scripts/       — init_db.sql, migrate_memory_sessions.sql
+benchmark/     — ST coding bench (st_coding_bench.json, runner), Agents4PLC runner
+scripts/       — init_db.sql, migrate_memory_sessions.sql, migrate_benchmark_metrics.sql
 matiec/        — MatIEC HTTP-сервис
 models/        — GGUF-файлы эмбеддинга (не в git)
 ```
