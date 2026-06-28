@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     # Agent (context_limit = input + output; max_tokens is output only)
     agent_max_iterations: int = 10
     expert_max_iterations: int = 5
+    expert_max_validation_attempts: int = 3
     agent_context_limit: int = 131_072
     agent_input_reserve: int = 16_384
     agent_max_tokens: int = 120_000
@@ -39,6 +40,10 @@ class Settings(BaseSettings):
     chunk_size: int    = 1000
     chunk_overlap: int = 200
     top_k_retrieval: int = 5
+
+    # Benchmark (ST coding suite)
+    benchmark_max_validation_attempts: int = 2
+    benchmark_st_guide_path: str = "benchmark/assets/IEC-61131-3-ST-GUIDE.md"
 
     # OCR
     ocr_backend: str = "openrouter"  # paddle | openrouter

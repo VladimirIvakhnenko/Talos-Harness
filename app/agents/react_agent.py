@@ -5,11 +5,13 @@ app/agents/react_agent.py — LangGraph: Retrieval (deterministic) + Expert (ReA
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph, END
 
 from app.agents.llm_client import get_llm, embed_single
@@ -17,6 +19,7 @@ from app.prompts.system_prompts import EXPERT_PROMPT, ENGINEER_PROMPT
 from app.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 _RETRIEVAL_DOC_MAX_CHARS = 8000
 _RETRIEVAL_HISTORY_MESSAGES = 5
@@ -32,13 +35,22 @@ class AgentState(TypedDict):
     final_code: str | None
     matiec_ok: bool | None
     validation_attempts: int
+    max_validation_attempts: int | None
     tokens: dict
 
 
-@tool
-async def generate_st_code(spec: str, controller: str = "elbrus") -> str:
-    """Generate IEC 61131-3 Structured Text or PLCopen XML from specification."""
-    llm = get_llm("engineer", tool_name="generate_st_code")
+async def _generate_st_code_impl(
+    spec: str,
+    controller: str = "elbrus",
+    session_id: str | None = None,
+    task_id: str | None = None,
+) -> str:
+    llm = get_llm(
+        "engineer",
+        session_id=session_id,
+        task_id=task_id,
+        tool_name="generate_st_code",
+    )
     msgs = [
         SystemMessage(content=ENGINEER_PROMPT),
         HumanMessage(content=f"Controller: {controller}\n\nSpecification:\n{spec}"),
@@ -48,38 +60,52 @@ async def generate_st_code(spec: str, controller: str = "elbrus") -> str:
 
 
 @tool
-async def validate_st_syntax(code: str, task_id: str = "agent_val") -> str:
-    """Validate ST code syntax using MatIEC compiler."""
-    from app.tools.matiec_client import validate_st
-    result = await validate_st(code, task_id)
+async def generate_st_code(spec: str, controller: str = "elbrus") -> str:
+    """Generate IEC 61131-3 Structured Text or PLCopen XML from specification."""
+    return await _generate_st_code_impl(spec, controller)
+
+
+@tool
+async def validate_st_syntax(code: str = "", task_id: str = "agent_val") -> str:
+    """Validate ST code syntax using MatIEC compiler (iec2c)."""
+    from app.tools.matiec_client import compile_st
+
+    if not code.strip():
+        return "❌ No ST code to validate. Call generate_st_code first."
+    result = await compile_st(code, task_id)
     if result.ok:
         return "✅ Syntax valid. Compilation rate: 1.0"
     errors = "\n".join(result.errors[:10])
+    if not errors and result.stderr:
+        errors = result.stderr.strip()[:2000]
     return f"❌ Syntax errors:\n{errors}"
 
 
 EXPERT_TOOLS = [generate_st_code, validate_st_syntax]
 
 
-async def _run_search_memory(query: str, session_id: str, top_k: int = 5) -> str:
+async def _run_search_memory(query: str, session_id: str, top_k: int = 5) -> tuple[str, list[float], list[str]]:
     from app.database import AsyncSessionLocal
     from app.memory.store import search_documents
 
     emb = await embed_single(query)
     async with AsyncSessionLocal() as db:
-        results = await search_documents(db, query, emb, session_id, top_k=top_k)
+        results, scores, sources = await search_documents(
+            db, query, emb, session_id, top_k=top_k, with_scores=True
+        )
     if not results:
-        return "No relevant documentation found."
+        return "No relevant documentation found.", [], []
     text = "\n\n---\n\n".join(
         f"[Source: {r['metadata'].get('source', '?')} | scope: {r['metadata'].get('scope', '?')}]\n{r['content']}"
         for r in results
     )
     if len(text) > _RETRIEVAL_DOC_MAX_CHARS:
-        return text[:_RETRIEVAL_DOC_MAX_CHARS] + "\n\n[... truncated ...]"
-    return text
+        return text[:_RETRIEVAL_DOC_MAX_CHARS] + "\n\n[... truncated ...]", scores, sources
+    return text, scores, sources
 
 
 async def retrieval_node(state: AgentState) -> AgentState:
+    _log_node(state, "retrieval")
     from app.database import AsyncSessionLocal
     from app.memory.store import load_chat_history
 
@@ -87,7 +113,7 @@ async def retrieval_node(state: AgentState) -> AgentState:
     sid = state["session_id"]
     upload = (state.get("upload_context") or "").strip()
 
-    document_chunks = await _run_search_memory(
+    document_chunks, retrieval_scores, retrieval_sources = await _run_search_memory(
         query, sid, top_k=settings.top_k_retrieval
     )
     history_msgs: list[dict] = []
@@ -104,8 +130,121 @@ async def retrieval_node(state: AgentState) -> AgentState:
         "upload_notes": upload,
         "doc_count": doc_count,
         "history_count": len(recent),
+        "retrieval_scores": retrieval_scores,
+        "retrieval_sources": retrieval_sources,
     }
     return {**state, "retrieval_context": retrieval_context}
+
+
+def _tool_rounds(state: AgentState) -> int:
+    return sum(
+        1
+        for m in state["messages"]
+        if getattr(m, "type", "") == "ai" and getattr(m, "tool_calls", None)
+    )
+
+
+def _last_validation_ok(state: AgentState) -> bool:
+    for m in reversed(state["messages"]):
+        if getattr(m, "type", "") != "tool":
+            continue
+        if getattr(m, "name", "") != "validate_st_syntax":
+            continue
+        content = _content_str(getattr(m, "content", ""))
+        return "Syntax valid" in content or content.startswith("✅")
+    return False
+
+
+def _has_generated_st_code(state: AgentState) -> bool:
+    return _last_generated_st_code(state["messages"]) is not None
+
+
+def _last_generated_st_code(messages: list) -> str | None:
+    for m in reversed(messages):
+        if getattr(m, "type", "") != "tool" or getattr(m, "name", "") != "generate_st_code":
+            continue
+        content = _content_str(getattr(m, "content", "")).strip()
+        if not content:
+            continue
+        if any(kw in content for kw in ("PROGRAM", "FUNCTION_BLOCK", "FUNCTION")):
+            return content
+        if "<?xml" in content or "<project" in content.lower():
+            return content
+    return None
+
+
+def _normalize_st(code: str) -> str:
+    return "\n".join(line.rstrip() for line in code.replace("\r\n", "\n").splitlines()).strip()
+
+
+def _max_validation_attempts(state: AgentState) -> int:
+    override = state.get("max_validation_attempts")
+    if override is not None:
+        return override
+    return settings.expert_max_validation_attempts
+
+
+def _generate_attempts(messages: list) -> int:
+    return sum(
+        1
+        for m in messages
+        if getattr(m, "type", "") == "tool" and getattr(m, "name", "") == "generate_st_code"
+    )
+
+
+def _first_validation_ok(messages: list) -> bool:
+    seen_validate = 0
+    for m in messages:
+        if getattr(m, "type", "") != "tool" or getattr(m, "name", "") != "validate_st_syntax":
+            continue
+        seen_validate += 1
+        content = _content_str(getattr(m, "content", ""))
+        ok = "Syntax valid" in content or content.startswith("✅")
+        if seen_validate == 1:
+            return ok
+    return False
+
+
+def _agent_result_from_state(result: dict, sid: str) -> dict:
+    messages = result.get("messages") or []
+    last_msg = messages[-1] if messages else None
+    retrieval_ctx = result.get("retrieval_context") or {}
+    validation_attempts = result.get("validation_attempts", 0)
+    matiec_ok = result.get("matiec_ok")
+    return {
+        "session_id": sid,
+        "task_id": result.get("task_id"),
+        "response": _content_str(last_msg.content) if last_msg and hasattr(last_msg, "content") else "",
+        "final_code": result.get("final_code"),
+        "matiec_ok": matiec_ok,
+        "validation_attempts": validation_attempts,
+        "generate_attempts": _generate_attempts(messages),
+        "tool_rounds": _tool_rounds(result),
+        "pass_at_1": validation_attempts == 1 and matiec_ok is True,
+        "retrieval_context": retrieval_ctx,
+        "steps": len(messages),
+    }
+def _compute_recursion_limit(state: AgentState | None = None) -> int:
+    max_tr = settings.expert_max_iterations
+    max_va = _max_validation_attempts(state) if state else settings.expert_max_validation_attempts
+    return 2 + max(max_tr, max_va) * 2 + 4
+
+
+def _log_node(state: AgentState, node_name: str) -> None:
+    logger.info(
+        "node=%s session=%s tool_rounds=%s validation_attempts=%s",
+        node_name,
+        (state.get("session_id") or "")[:8],
+        _tool_rounds(state),
+        state.get("validation_attempts", 0),
+    )
+
+
+def _resolve_task_id(session_id: str, task_id: str | None) -> str:
+    if task_id:
+        return task_id
+    sid_prefix = session_id.replace("-", "")[:8]
+    return f"{sid_prefix}_{uuid.uuid4().hex[:8]}"
 
 
 def _expert_system(state: AgentState) -> str:
@@ -126,10 +265,35 @@ def _expert_system(state: AgentState) -> str:
         ctx_parts.append("Recent chat history:\n" + ctx["recent_history"])
     if ctx_parts:
         parts.append("=== RETRIEVAL CONTEXT ===\n" + "\n\n".join(ctx_parts))
+
+    va = state.get("validation_attempts", 0)
+    tr = _tool_rounds(state)
+    max_va = _max_validation_attempts(state)
+    max_tr = settings.expert_max_iterations
+    parts.append(
+        "=== ATTEMPTS BUDGET ===\n"
+        f"Validation attempts used: {va} / {max_va}\n"
+        f"Tool rounds used: {tr} / {max_tr}\n"
+        "If attempts remain and last validation failed: you MUST call generate_st_code again.\n"
+        "If attempts exhausted: Final Answer only, no more tool_calls."
+    )
+    if va >= max_va or tr >= max_tr:
+        parts.append(
+            "=== LIMIT REACHED ===\n"
+            "Attempt budget exhausted. Return Final Answer with the best available code "
+            "WITHOUT calling any tools."
+        )
+    elif va >= max_va - 1 or tr >= max_tr - 1:
+        parts.append(
+            "=== LIMIT WARNING ===\n"
+            "One attempt remaining. If validation fails again, return Final Answer "
+            "with the best code on the next turn without tools."
+        )
     return "\n\n".join(parts)
 
 
 async def expert_planner_node(state: AgentState) -> AgentState:
+    _log_node(state, "expert_planner")
     llm = get_llm(
         "engineer",
         session_id=state["session_id"],
@@ -143,6 +307,7 @@ async def expert_planner_node(state: AgentState) -> AgentState:
 
 
 async def expert_tools_node(state: AgentState) -> AgentState:
+    _log_node(state, "expert_tools")
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None) or []
     tid = state.get("task_id") or "agent"
@@ -155,9 +320,27 @@ async def expert_tools_node(state: AgentState) -> AgentState:
         tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
 
         if name == "generate_st_code":
-            content = await generate_st_code.ainvoke(args)
+            content = await _generate_st_code_impl(
+                args.get("spec", ""),
+                args.get("controller", "elbrus"),
+                state["session_id"],
+                state.get("task_id"),
+            )
         elif name == "validate_st_syntax":
-            args = {**args, "task_id": args.get("task_id", tid)}
+            last_code = _last_generated_st_code(state["messages"])
+            requested = _normalize_st(args.get("code") or "")
+            if last_code:
+                if requested != _normalize_st(last_code):
+                    logger.warning(
+                        "validate_st_syntax: LLM code mismatch (req=%d chars, generated=%d chars) — using generate_st_code output",
+                        len(requested),
+                        len(last_code),
+                    )
+                args = {**args, "code": last_code}
+            elif requested:
+                args = {**args, "code": requested}
+            val_tid = f"{tid}_v{validation_attempts + 1}"
+            args = {**args, "task_id": args.get("task_id", val_tid)}
             content = await validate_st_syntax.ainvoke(args)
             validation_attempts += 1
         else:
@@ -173,19 +356,29 @@ async def expert_tools_node(state: AgentState) -> AgentState:
 
 
 def should_continue(state: AgentState) -> str:
+    va = state.get("validation_attempts", 0)
+    tr = _tool_rounds(state)
+    if va >= _max_validation_attempts(state):
+        logger.info("should_continue=END reason=validation_attempts session=%s", (state.get("session_id") or "")[:8])
+        return END
+    if tr >= settings.expert_max_iterations:
+        logger.info("should_continue=END reason=tool_rounds session=%s", (state.get("session_id") or "")[:8])
+        return END
+    if _last_validation_ok(state) and _has_generated_st_code(state):
+        logger.info("should_continue=END reason=validation_ok session=%s", (state.get("session_id") or "")[:8])
+        return END
+
     last = state["messages"][-1]
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
     return END
 
 
-async def post_process(state: AgentState) -> AgentState:
-    from app.tools.matiec_client import compile_st
-
+def _extract_final_code_from_messages(messages: list) -> tuple[str | None, bool]:
     code = None
     is_st = False
 
-    for m in reversed(state["messages"]):
+    for m in reversed(messages):
         if getattr(m, "type", "") != "tool" or getattr(m, "name", "") != "generate_st_code":
             continue
         content = _content_str(getattr(m, "content", ""))
@@ -195,12 +388,21 @@ async def post_process(state: AgentState) -> AgentState:
             code = content
         break
 
-    if not code and state["messages"]:
-        last_content = _content_str(state["messages"][-1].content)
+    if not code and messages:
+        last_content = _content_str(getattr(messages[-1], "content", ""))
         is_st = "PROGRAM" in last_content or "FUNCTION_BLOCK" in last_content
         is_xml = "<?xml" in last_content or "<project" in last_content.lower()
         if is_st or is_xml:
             code = last_content
+
+    return code, is_st
+
+
+async def post_process(state: AgentState) -> AgentState:
+    _log_node(state, "post_process")
+    from app.tools.matiec_client import compile_st
+
+    code, is_st = _extract_final_code_from_messages(state["messages"])
 
     matiec_ok = None
     if code and is_st:
@@ -333,63 +535,54 @@ def _build_initial_state(
     session_id: str,
     task_id: str | None,
     upload_context: str | None,
+    max_validation_attempts: int | None = None,
 ) -> AgentState:
+    resolved_task_id = _resolve_task_id(session_id, task_id)
     return {
         "messages": [HumanMessage(content=user_message)],
         "session_id": session_id,
         "user_request": user_message,
-        "task_id": task_id,
+        "task_id": resolved_task_id,
         "upload_context": upload_context,
         "retrieval_context": {},
         "final_code": None,
         "matiec_ok": None,
         "validation_attempts": 0,
+        "max_validation_attempts": max_validation_attempts,
         "tokens": {},
     }
 
 
-async def stream_agent(
-    user_message: str,
-    session_id: str | None = None,
-    task_id: str | None = None,
-    context: str | None = None,
-):
-    sid = session_id or str(uuid.uuid4())
-    graph = get_graph()
-    steps: list[str] = []
-    final_state: dict = {}
-    all_messages: list = []
+def _append_stream_update(
+    node_name: str,
+    patch: dict,
+    steps: list[str],
+    all_messages: list,
+) -> None:
+    if node_name == "retrieval":
+        ctx = patch.get("retrieval_context", {})
+        if ctx:
+            steps.append(_format_retrieval_step(ctx))
+    elif node_name == "expert_planner":
+        msgs = patch.get("messages", [])
+        if msgs:
+            all_messages.extend(msgs)
+            steps.append(_format_expert_step(msgs[-1]))
+    elif node_name == "expert_tools":
+        for m in patch.get("messages", []):
+            all_messages.append(m)
+            if getattr(m, "type", "") == "tool":
+                name = getattr(m, "name", "tool")
+                steps.append(_format_tool_observation(name, getattr(m, "content", "")))
+    elif node_name == "post_process":
+        pass
 
-    initial_state = _build_initial_state(user_message, sid, task_id, context)
-    all_messages = list(initial_state["messages"])
 
-    graph_config = {
-        "recursion_limit": max(settings.expert_max_iterations * 2 + 2, 12),
-    }
-
-    async for update in graph.astream(initial_state, stream_mode="updates", config=graph_config):
-        for node_name, patch in update.items():
-            if node_name == "retrieval":
-                ctx = patch.get("retrieval_context", {})
-                if ctx:
-                    steps.append(_format_retrieval_step(ctx))
-            elif node_name == "expert_planner":
-                msgs = patch.get("messages", [])
-                if msgs:
-                    all_messages.extend(msgs)
-                    steps.append(_format_expert_step(msgs[-1]))
-            elif node_name == "expert_tools":
-                for m in patch.get("messages", []):
-                    all_messages.append(m)
-                    if getattr(m, "type", "") == "tool":
-                        name = getattr(m, "name", "tool")
-                        steps.append(_format_tool_observation(name, getattr(m, "content", "")))
-            elif node_name == "post_process":
-                final_state.update(patch)
-
-        if steps:
-            yield "\n\n".join(steps)
-
+def _finalize_agent_steps(
+    steps: list[str],
+    all_messages: list,
+    final_state: dict,
+) -> list[str]:
     if all_messages:
         last = all_messages[-1]
         if getattr(last, "type", "") == "ai":
@@ -414,6 +607,55 @@ async def stream_agent(
     elif code:
         steps.append(f"```\n{code}\n```")
 
+    return steps
+
+
+async def stream_agent(
+    user_message: str,
+    session_id: str | None = None,
+    task_id: str | None = None,
+    context: str | None = None,
+):
+    sid = session_id or str(uuid.uuid4())
+    graph = get_graph()
+    steps: list[str] = []
+    final_state: dict = {}
+    all_messages: list = []
+
+    initial_state = _build_initial_state(user_message, sid, task_id, context)
+    all_messages = list(initial_state["messages"])
+
+    graph_config = {"recursion_limit": _compute_recursion_limit(initial_state)}
+
+    try:
+        async for update in graph.astream(initial_state, stream_mode="updates", config=graph_config):
+            for node_name, patch in update.items():
+                _append_stream_update(node_name, patch, steps, all_messages)
+                if node_name == "post_process":
+                    final_state.update(patch)
+
+            if steps:
+                yield "\n\n".join(steps)
+    except GraphRecursionError:
+        logger.warning(
+            "GraphRecursionError session=%s task_id=%s",
+            sid[:8],
+            initial_state.get("task_id"),
+        )
+        code, is_st = _extract_final_code_from_messages(all_messages)
+        if code:
+            final_state["final_code"] = code
+            from app.tools.matiec_client import compile_st
+
+            if is_st:
+                result = await compile_st(code, initial_state.get("task_id") or "agent")
+                final_state["matiec_ok"] = result.ok
+        steps.append(
+            "**⚠ Лимит итераций:** достигнут recursion_limit. "
+            "Показан последний сгенерированный код."
+        )
+
+    steps = _finalize_agent_steps(steps, all_messages, final_state)
     yield "\n\n".join(steps)
 
 
@@ -422,25 +664,39 @@ async def run_agent(
     session_id: str | None = None,
     task_id: str | None = None,
     context: str | None = None,
+    max_validation_attempts: int | None = None,
 ) -> dict:
     sid = session_id or str(uuid.uuid4())
     graph = get_graph()
 
-    initial_state = _build_initial_state(user_message, sid, task_id, context)
-    graph_config = {
-        "recursion_limit": max(settings.expert_max_iterations * 2 + 2, 12),
-    }
+    initial_state = _build_initial_state(
+        user_message, sid, task_id, context, max_validation_attempts
+    )
+    graph_config = {"recursion_limit": _compute_recursion_limit(initial_state)}
 
-    result = await graph.ainvoke(initial_state, config=graph_config)
-    last_msg = result["messages"][-1] if result.get("messages") else None
+    try:
+        result = await graph.ainvoke(initial_state, config=graph_config)
+    except GraphRecursionError:
+        logger.warning(
+            "GraphRecursionError session=%s task_id=%s",
+            sid[:8],
+            initial_state.get("task_id"),
+        )
+        return {
+            "session_id": sid,
+            "task_id": initial_state.get("task_id"),
+            "response": "Достигнут лимит итераций. Используйте stream_agent для частичного результата.",
+            "final_code": None,
+            "matiec_ok": None,
+            "validation_attempts": 0,
+            "generate_attempts": 0,
+            "tool_rounds": 0,
+            "pass_at_1": False,
+            "retrieval_context": {},
+            "steps": 0,
+        }
 
-    return {
-        "session_id": sid,
-        "response": _content_str(last_msg.content) if last_msg and hasattr(last_msg, "content") else "",
-        "final_code": result.get("final_code"),
-        "matiec_ok": result.get("matiec_ok"),
-        "steps": len(result.get("messages", [])),
-    }
+    return _agent_result_from_state(result, sid)
 
 
 reset_graph()

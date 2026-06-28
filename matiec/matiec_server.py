@@ -7,6 +7,7 @@ matiec_server.py — HTTP-обёртка над MatIEC (iec2c / iec2iec).
   GET  /health    — статус сервиса
 """
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -124,10 +125,19 @@ def _run_matiec(req: CompileRequest, mode: str) -> CompileResult:
 
 
 def _extract_errors(text: str) -> list[str]:
-    return [
-        line.strip() for line in text.splitlines()
-        if any(kw in line.lower() for kw in ["error", "syntax error", "undefined"])
-    ]
+    """MatIEC stderr lines only — ignore ieclib stdout (PID blocks use ERROR as var name)."""
+    errors: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if re.search(r"\.st:\d+:\s*error:", s, re.IGNORECASE):
+            errors.append(s)
+        elif re.search(r"error\(s\)\s+found", s, re.IGNORECASE):
+            errors.append(s)
+        elif re.search(r"^error:\s", s, re.IGNORECASE):
+            errors.append(s)
+    return errors
 
 
 def _extract_warnings(text: str) -> list[str]:

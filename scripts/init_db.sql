@@ -80,12 +80,19 @@ CREATE TABLE IF NOT EXISTS benchmark_results (
     cost_usd               NUMERIC(12,8),
     latency_ms             INTEGER,
     error_message          TEXT,
+    session_id             UUID,
+    validation_attempts    INTEGER,
+    generate_attempts      INTEGER,
+    pass_at_1              BOOLEAN,
+    benchmark_suite        VARCHAR(20) DEFAULT 'agents4plc',
+    extra_metrics          JSONB DEFAULT '{}',
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS br_run    ON benchmark_results (run_id);
 CREATE INDEX IF NOT EXISTS br_task   ON benchmark_results (task_id);
 CREATE INDEX IF NOT EXISTS br_config ON benchmark_results (config);
+CREATE INDEX IF NOT EXISTS br_suite  ON benchmark_results (benchmark_suite);
 
 -- ── uploaded_docs ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS uploaded_docs (
@@ -111,18 +118,22 @@ SELECT
 FROM token_usage WHERE session_id IS NOT NULL
 GROUP BY session_id;
 
-CREATE OR REPLACE VIEW v_benchmark_summary AS
+DROP VIEW IF EXISTS v_benchmark_summary;
+CREATE VIEW v_benchmark_summary AS
 SELECT
-    run_id, config, difficulty,
+    run_id, config, difficulty, benchmark_suite,
     COUNT(*) AS total_tasks,
     ROUND(100.0 * SUM(CASE WHEN compilation_ok         THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS compilation_rate_pct,
+    ROUND(100.0 * SUM(CASE WHEN pass_at_1               THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS pass_at_1_pct,
     ROUND(100.0 * SUM(CASE WHEN formal_verification_ok THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS fv_pass_rate_pct,
     ROUND(100.0 * SUM(CASE WHEN execution_correct      THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS exec_correct_pct,
+    ROUND(AVG(validation_attempts)::NUMERIC, 2) AS avg_validation_attempts,
     SUM(total_tokens)                          AS total_tokens,
     ROUND(SUM(cost_usd)::NUMERIC, 4)           AS total_cost_usd,
+    ROUND(AVG(latency_ms)::NUMERIC, 0)         AS avg_latency_ms,
     MAX(created_at)                            AS run_at
 FROM benchmark_results
-GROUP BY run_id, config, difficulty
+GROUP BY run_id, config, difficulty, benchmark_suite
 ORDER BY run_at DESC;
 
 DO $$ BEGIN RAISE NOTICE 'PLC Agent DB initialized'; END $$;

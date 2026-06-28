@@ -171,21 +171,47 @@ async def search_documents(
     emb: list[float],
     session_id: str,
     top_k: int = 5,
-) -> list[dict]:
+    *,
+    with_scores: bool = False,
+) -> list[dict] | tuple[list[dict], list[float], list[str]]:
     """Dense-only RAG: global docs + docs текущей сессии, child → parent."""
     _ = query  # embedding carries semantic signal; query kept for API compat
     hits = await dense_search(
         db, emb, top_k * 4, filter_type="doc", chunk_level="child",
         doc_scope_filter="documents", session_id=session_id,
     )
+    hit_scores = {h["id"]: float(h.get("score") or 0.0) for h in hits}
+    hit_sources = {
+        h["id"]: (h.get("metadata") or {}).get("source", "?") for h in hits
+    }
+    parent_score: dict[int, float] = {}
+    parent_source: dict[int, str] = {}
+    for h in hits:
+        pid = h.get("parent_id")
+        if pid is None:
+            pid = h["id"]
+        sc = hit_scores.get(h["id"], 0.0)
+        if sc > parent_score.get(pid, 0.0):
+            parent_score[pid] = sc
+            parent_source[pid] = hit_sources.get(h["id"], "?")
+
     parents = await lift_to_parents(db, hits)
     seen: set[int] = set()
     unique: list[dict] = []
+    scores: list[float] = []
+    sources: list[str] = []
     for p in parents:
         if p["id"] not in seen:
             seen.add(p["id"])
             unique.append(p)
-    return unique[:top_k]
+            scores.append(parent_score.get(p["id"], 0.0))
+            sources.append(parent_source.get(p["id"], "?"))
+    unique = unique[:top_k]
+    scores = scores[:top_k]
+    sources = sources[:top_k]
+    if with_scores:
+        return unique, scores, sources
+    return unique
 
 
 async def save_chat_message(

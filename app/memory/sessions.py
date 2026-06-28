@@ -49,7 +49,7 @@ async def rename_session(db: AsyncSession, session_id: str, title: str) -> None:
 
 
 async def ensure_session(db: AsyncSession, session_id: str | None, title: str = "Новый чат") -> str:
-    """Вернуть существующий session_id или создать новую сессию."""
+    """Вернуть существующий session_id или создать сессию (при resume — с заданным id)."""
     if session_id:
         row = await db.execute(
             text("SELECT id::text FROM sessions WHERE id = CAST(:id AS uuid)"),
@@ -57,4 +57,10 @@ async def ensure_session(db: AsyncSession, session_id: str | None, title: str = 
         )
         if row.scalar_one_or_none():
             return session_id
+        await db.execute(
+            text("INSERT INTO sessions (id, title) VALUES (CAST(:id AS uuid), :title)"),
+            {"id": session_id, "title": title[:120]},
+        )
+        await db.commit()
+        return session_id
     return await create_session(db, title)

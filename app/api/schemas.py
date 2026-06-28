@@ -81,6 +81,49 @@ class BenchmarkRunRequest(BaseModel):
         }
 
 
+class StCodingBenchRunRequest(BaseModel):
+    config: str = Field(
+        "baseline",
+        description="Один режим прогона: baseline | agent_isolated | agent_single_session",
+    )
+    n_tasks: int = Field(10, ge=1, le=50, description="Количество задач из st_coding_bench.json")
+    configs: Optional[list[str]] = Field(
+        None,
+        description="Устарело: используйте config. Если задано — переопределяет config.",
+    )
+    guide_path: Optional[str] = Field(
+        None,
+        description="Путь к ST-гайду (MD). По умолчанию benchmark/assets/IEC-61131-3-ST-GUIDE.md",
+    )
+    max_validation_attempts: int = Field(2, ge=1, le=10, description="Лимит попыток validate_st_syntax")
+    session_id: Optional[str] = Field(
+        None,
+        description="UUID сессии для agent_single_session — продолжение в том же чате",
+    )
+    run_id: Optional[str] = Field(
+        None,
+        description="UUID прогона в benchmark_results (для склейки метрик)",
+    )
+    start_task_id: Optional[str] = Field(
+        None,
+        description="Начать с task_id (например IA06)",
+    )
+    resume: bool = Field(
+        False,
+        description="Продолжить последний прогон: тот же session/run, пропустить выполненные задачи",
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "config": "agent_single_session",
+                "n_tasks": 10,
+                "max_validation_attempts": 2,
+                "resume": True,
+            }
+        }
+
+
 class HealthResponse(BaseModel):
     status: str
     checks: dict[str, str]

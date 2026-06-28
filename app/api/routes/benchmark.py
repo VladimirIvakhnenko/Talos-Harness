@@ -1,7 +1,7 @@
 ﻿from fastapi import APIRouter
 from sqlalchemy import text
 
-from app.api.schemas import BenchmarkRunRequest
+from app.api.schemas import BenchmarkRunRequest, StCodingBenchRunRequest
 from app.database import get_db
 
 router = APIRouter(tags=["Benchmark"])
@@ -26,3 +26,23 @@ async def benchmark_results():
     async with get_db() as db:
         rows = await db.execute(text("SELECT * FROM v_benchmark_summary LIMIT 50"))
         return {"results": [dict(r._mapping) for r in rows.fetchall()]}
+
+
+@router.post("/benchmark/st_coding/run", summary="Прогон ST coding benchmark — одна config за вызов")
+async def st_coding_benchmark_run(body: StCodingBenchRunRequest):
+    from benchmark.st_coding_runner import run_st_coding_benchmark
+
+    async with get_db() as db:
+        result = await run_st_coding_benchmark(
+            n_tasks=body.n_tasks,
+            config=body.config,
+            configs=body.configs,
+            guide_path=body.guide_path,
+            max_validation_attempts=body.max_validation_attempts,
+            session_id=body.session_id,
+            run_id=body.run_id,
+            start_task_id=body.start_task_id,
+            resume=body.resume,
+            db=db,
+        )
+    return result
