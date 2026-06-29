@@ -39,7 +39,18 @@ class Settings(BaseSettings):
     agent_temperature: float  = 0.1
     chunk_size: int    = 1000
     chunk_overlap: int = 200
-    top_k_retrieval: int = 5
+    chunk_parent_size: int = 1500
+    chunk_parent_overlap: int = 150
+    chunk_child_size: int = 800
+    chunk_child_overlap: int = 80
+    chunk_markdown_parent_level: int = 3
+    chunking_mode: str = "auto"  # auto | markdown | recursive
+    top_k_retrieval: int = 10
+    retrieval_doc_max_chars: int = 12000
+    retrieval_candidate_multiplier: int = 4
+    retrieval_hybrid_enabled: bool = True
+    retrieval_rrf_k: int = 60
+    retrieval_sibling_bonus: float = 0.05
 
     # Benchmark (ST coding suite)
     benchmark_max_validation_attempts: int = 2

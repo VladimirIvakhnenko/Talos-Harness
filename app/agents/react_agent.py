@@ -21,7 +21,6 @@ from app.config import get_settings
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-_RETRIEVAL_DOC_MAX_CHARS = 8000
 _RETRIEVAL_HISTORY_MESSAGES = 5
 
 
@@ -99,8 +98,9 @@ async def _run_search_memory(query: str, session_id: str, top_k: int = 5) -> tup
         f"[Source: {r['metadata'].get('source', '?')} | scope: {r['metadata'].get('scope', '?')}]\n{r['content']}"
         for r in results
     )
-    if len(text) > _RETRIEVAL_DOC_MAX_CHARS:
-        return text[:_RETRIEVAL_DOC_MAX_CHARS] + "\n\n[... truncated ...]", scores, sources
+    max_chars = settings.retrieval_doc_max_chars
+    if len(text) > max_chars:
+        return text[:max_chars] + "\n\n[... truncated ...]", scores, sources
     return text, scores, sources
 
 

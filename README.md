@@ -124,7 +124,10 @@ AGENT_MAX_TOKENS=8192
 | `EMBEDDING_BACKEND` | `local` (llama.cpp) \| `openrouter` |
 | `LLAMA_EMBEDDING_URL` | Docker: `http://llama-embedding:8080` |
 | `EXPERT_MAX_ITERATIONS` | Лимит шагов ReAct Expert (default 5) |
-| `TOP_K_RETRIEVAL` | Число фрагментов в Retrieval |
+| `TOP_K_RETRIEVAL` | Число parent-фрагментов в Retrieval (default 8) |
+| `CHUNKING_MODE` | `auto` \| `markdown` \| `recursive` — структурный чанкинг MD |
+| `RETRIEVAL_HYBRID_ENABLED` | Dense + keyword (tsvector) через RRF |
+| `RETRIEVAL_DOC_MAX_CHARS` | Лимит символов документации в промпте (default 12000) |
 | `BENCHMARK_MAX_VALIDATION_ATTEMPTS` | Лимит `validate_st_syntax` в ST coding bench (default 2) |
 | `BENCHMARK_ST_GUIDE_PATH` | MD-гайд для RAG в бенчмарке |
 
@@ -234,6 +237,13 @@ curl http://localhost:8000/benchmark/results
 ```
 
 ST-гайд для RAG: [`benchmark/assets/IEC-61131-3-ST-GUIDE.md`](benchmark/assets/IEC-61131-3-ST-GUIDE.md).
+
+### Индексация и retrieval (MD)
+
+- **Markdown-aware chunking:** для `.md` и `doc_type=iec_standard` документ режется по заголовкам `###` (parent), child — подразделы, таблицы и code blocks целиком.
+- **Parent-child RAG:** поиск по child-эмбеддингам, в контекст LLM — parent-разделы.
+- **Hybrid search:** cosine (pgvector) + `tsvector` (config `simple`), fusion через RRF.
+- Тесты чанкера: `python tests/test_markdown_chunker.py`
 
 ## MatIEC
 
