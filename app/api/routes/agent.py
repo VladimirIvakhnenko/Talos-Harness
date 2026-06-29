@@ -1,7 +1,7 @@
-﻿import uuid
+import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from app.api.deps import UPLOAD_DIR, _last_st
@@ -18,11 +18,24 @@ router = APIRouter(tags=["Agent"])
 
 
 @router.post("/chat", response_model=ChatResponse, summary="ReAct-агент: генерация ST-кода на естественном языке")
-async def chat(body: ChatRequest):
+async def chat(body: ChatRequest, request: Request):
     from app.agents.react_agent import run_agent
 
     sid = body.session_id or str(uuid.uuid4())
-    result = await run_agent(body.message, session_id=sid)
+
+    # Resolve active skills: per-request overrides global, else auto-route
+    skills = body.skills
+    if skills is None:
+        from app.config import get_settings
+        settings = get_settings()
+        registry = getattr(request.app.state, "skill_registry", None)
+        if registry is not None and settings.skills_enabled:
+            from app.skills.router import route_skills
+            skills = await route_skills(body.message, registry)
+        elif registry is not None:
+            skills = list(registry.active_slugs)
+
+    result = await run_agent(body.message, session_id=sid, skills=skills)
     return ChatResponse(**result)
 
 

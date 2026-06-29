@@ -1,4 +1,4 @@
-﻿from functools import lru_cache
+from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     ocr_version: str = "PP-OCRv5"
     ocr_use_server_models: bool = True
     ocr_min_score: float = 0.5
+
+    # Skills (dynamic skill loading)
+    skills_enabled: bool = True
+    skills_dir: str = "skills"
+    skills_upload_dir: str = "app/skills/uploads"
+    skills_max_upload_mb: int = 1
 
     # App
     app_env: str    = "development"

@@ -1,7 +1,7 @@
-﻿"""
+"""
 app/agents/react_agent.py — LangGraph: Retrieval (deterministic) + Expert (ReAct).
 
-Инструменты Expert: generate_st_code, validate_st_syntax.
+Инструменты Expert: generate_st_code, validate_st_syntax + skill tools.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph, END
 
 from app.agents.llm_client import get_llm, embed_single
-from app.prompts.system_prompts import EXPERT_PROMPT, ENGINEER_PROMPT
+from app.prompts.system_prompts import BASE_EXPERT_PROMPT, ENGINEER_PROMPT
 from app.config import get_settings
 
 settings = get_settings()
@@ -36,6 +36,7 @@ class AgentState(TypedDict):
     validation_attempts: int
     max_validation_attempts: int | None
     tokens: dict
+    active_skills: list[str]
 
 
 async def _generate_st_code_impl(
@@ -44,6 +45,10 @@ async def _generate_st_code_impl(
     session_id: str | None = None,
     task_id: str | None = None,
 ) -> str:
+    from app.skills.prompt_builder import build_engineer_prompt
+
+    active = _skill_registry.active_slugs if _skill_registry else None
+    prompt = build_engineer_prompt(ENGINEER_PROMPT, _skill_registry, active)
     llm = get_llm(
         "engineer",
         session_id=session_id,
@@ -51,7 +56,7 @@ async def _generate_st_code_impl(
         tool_name="generate_st_code",
     )
     msgs = [
-        SystemMessage(content=ENGINEER_PROMPT),
+        SystemMessage(content=prompt),
         HumanMessage(content=f"Controller: {controller}\n\nSpecification:\n{spec}"),
     ]
     resp = await llm.ainvoke(msgs)
@@ -248,7 +253,23 @@ def _resolve_task_id(session_id: str, task_id: str | None) -> str:
 
 
 def _expert_system(state: AgentState) -> str:
-    parts = [EXPERT_PROMPT]
+    # Build base prompt with skill injection
+    from app.skills.prompt_builder import build_expert_prompt
+
+    active_skills = state.get("active_skills") or []
+    base = build_expert_prompt(BASE_EXPERT_PROMPT, _skill_registry, active_skills)
+
+    # Append tool list dynamically
+    tool_names = ["generate_st_code", "validate_st_syntax"]
+    if _skill_registry:
+        try:
+            for t in _skill_registry.active_tools():
+                tool_names.append(t.name)
+        except Exception:
+            pass
+    base += f"\n\nTools: {', '.join(tool_names)}."
+
+    parts = [base]
     req = state.get("user_request", "")
     if req:
         parts.append(
@@ -300,7 +321,14 @@ async def expert_planner_node(state: AgentState) -> AgentState:
         task_id=state.get("task_id"),
         react_step="thought",
     )
-    llm_with_tools = llm.bind_tools(EXPERT_TOOLS)
+    # Combine base tools with skill tools
+    all_tools = list(EXPERT_TOOLS)
+    if _skill_registry:
+        try:
+            all_tools.extend(_skill_registry.active_tools())
+        except Exception:
+            pass
+    llm_with_tools = llm.bind_tools(all_tools)
     msgs = [SystemMessage(content=_expert_system(state))] + state["messages"]
     resp = await llm_with_tools.ainvoke(msgs)
     return {**state, "messages": state["messages"] + [resp]}
@@ -313,36 +341,31 @@ async def expert_tools_node(state: AgentState) -> AgentState:
     tid = state.get("task_id") or "agent"
     validation_attempts = state.get("validation_attempts", 0)
 
+    # Build dynamic dispatch map: builtin tools + skill tools
+    builtin_handlers: dict[str, callable] = {
+        "generate_st_code": _handle_generate_st_code,
+        "validate_st_syntax": _handle_validate_st_syntax,
+    }
+    skill_handlers: dict[str, callable] = {}
+    if _skill_registry:
+        try:
+            for t in _skill_registry.active_tools():
+                skill_handlers[t.name] = t.ainvoke
+        except Exception:
+            pass
+
     new_msgs: list = []
     for tc in tool_calls:
         name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
         args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
         tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
 
-        if name == "generate_st_code":
-            content = await _generate_st_code_impl(
-                args.get("spec", ""),
-                args.get("controller", "elbrus"),
-                state["session_id"],
-                state.get("task_id"),
+        if name in builtin_handlers:
+            content, validation_attempts = await builtin_handlers[name](
+                state, name, args, validation_attempts, tid
             )
-        elif name == "validate_st_syntax":
-            last_code = _last_generated_st_code(state["messages"])
-            requested = _normalize_st(args.get("code") or "")
-            if last_code:
-                if requested != _normalize_st(last_code):
-                    logger.warning(
-                        "validate_st_syntax: LLM code mismatch (req=%d chars, generated=%d chars) — using generate_st_code output",
-                        len(requested),
-                        len(last_code),
-                    )
-                args = {**args, "code": last_code}
-            elif requested:
-                args = {**args, "code": requested}
-            val_tid = f"{tid}_v{validation_attempts + 1}"
-            args = {**args, "task_id": args.get("task_id", val_tid)}
-            content = await validate_st_syntax.ainvoke(args)
-            validation_attempts += 1
+        elif name in skill_handlers:
+            content = await skill_handlers[name](args)
         else:
             content = f"Unknown tool: {name}"
 
@@ -353,6 +376,39 @@ async def expert_tools_node(state: AgentState) -> AgentState:
         "messages": state["messages"] + new_msgs,
         "validation_attempts": validation_attempts,
     }
+
+
+async def _handle_generate_st_code(
+    state: AgentState, name: str, args: dict, validation_attempts: int, tid: str
+) -> tuple[str, int]:
+    content = await _generate_st_code_impl(
+        args.get("spec", ""),
+        args.get("controller", "elbrus"),
+        state["session_id"],
+        state.get("task_id"),
+    )
+    return content, validation_attempts
+
+
+async def _handle_validate_st_syntax(
+    state: AgentState, name: str, args: dict, validation_attempts: int, tid: str
+) -> tuple[str, int]:
+    last_code = _last_generated_st_code(state["messages"])
+    requested = _normalize_st(args.get("code") or "")
+    if last_code:
+        if requested != _normalize_st(last_code):
+            logger.warning(
+                "validate_st_syntax: LLM code mismatch (req=%d chars, generated=%d chars) — using generate_st_code output",
+                len(requested),
+                len(last_code),
+            )
+        args = {**args, "code": last_code}
+    elif requested:
+        args = {**args, "code": requested}
+    val_tid = f"{tid}_v{validation_attempts + 1}"
+    args = {**args, "task_id": args.get("task_id", val_tid)}
+    content = await validate_st_syntax.ainvoke(args)
+    return content, validation_attempts + 1
 
 
 def should_continue(state: AgentState) -> str:
@@ -430,6 +486,13 @@ def build_graph() -> StateGraph:
 
 
 _graph = None
+_skill_registry: object = None  # set by set_skill_registry() from main.py
+
+
+def set_skill_registry(registry: object) -> None:
+    """Set the global skill registry reference (called from main.py lifespan)."""
+    global _skill_registry
+    _skill_registry = registry
 
 
 def get_graph():
@@ -536,6 +599,7 @@ def _build_initial_state(
     task_id: str | None,
     upload_context: str | None,
     max_validation_attempts: int | None = None,
+    skills: list[str] | None = None,
 ) -> AgentState:
     resolved_task_id = _resolve_task_id(session_id, task_id)
     return {
@@ -550,6 +614,7 @@ def _build_initial_state(
         "validation_attempts": 0,
         "max_validation_attempts": max_validation_attempts,
         "tokens": {},
+        "active_skills": skills or [],
     }
 
 
@@ -615,6 +680,7 @@ async def stream_agent(
     session_id: str | None = None,
     task_id: str | None = None,
     context: str | None = None,
+    skills: list[str] | None = None,
 ):
     sid = session_id or str(uuid.uuid4())
     graph = get_graph()
@@ -622,7 +688,7 @@ async def stream_agent(
     final_state: dict = {}
     all_messages: list = []
 
-    initial_state = _build_initial_state(user_message, sid, task_id, context)
+    initial_state = _build_initial_state(user_message, sid, task_id, context, skills=skills)
     all_messages = list(initial_state["messages"])
 
     graph_config = {"recursion_limit": _compute_recursion_limit(initial_state)}
@@ -665,12 +731,13 @@ async def run_agent(
     task_id: str | None = None,
     context: str | None = None,
     max_validation_attempts: int | None = None,
+    skills: list[str] | None = None,
 ) -> dict:
     sid = session_id or str(uuid.uuid4())
     graph = get_graph()
 
     initial_state = _build_initial_state(
-        user_message, sid, task_id, context, max_validation_attempts
+        user_message, sid, task_id, context, max_validation_attempts, skills=skills
     )
     graph_config = {"recursion_limit": _compute_recursion_limit(initial_state)}
 

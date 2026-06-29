@@ -1,4 +1,4 @@
-﻿"""
+"""
 app/main.py — FastAPI приложение с полным Swagger UI.
 
 Swagger: http://localhost:8000/docs
@@ -11,7 +11,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from app.api.routes import agent, benchmark, documents, memory, monitoring, sessions, system
+from app.api.routes import agent, benchmark, documents, memory, monitoring, sessions, system, skills
+from app.config import get_settings
 from app.database import get_db
 
 APP_DESCRIPTION = """
@@ -33,8 +34,29 @@ APP_DESCRIPTION = """
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings = get_settings()
+
+    # DB health check
     async with get_db() as db:
         await db.execute(text("SELECT 1"))
+
+    # Init skill registry
+    if settings.skills_enabled:
+        from app.agents.react_agent import set_skill_registry as set_agent_registry
+        from app.skills.registry import SkillRegistry
+
+        registry = SkillRegistry()
+        discovered = registry.discover_all()
+        app.state.skill_registry = registry
+        app.state.skills_enabled = True
+        set_agent_registry(registry)
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info("Skill registry initialized: %d skills discovered", len(discovered))
+    else:
+        app.state.skills_enabled = False
+
     yield
 
 
@@ -57,3 +79,4 @@ app.include_router(benchmark.router)
 app.include_router(memory.router)
 app.include_router(sessions.router)
 app.include_router(monitoring.router)
+app.include_router(skills.router)

@@ -206,12 +206,12 @@ async def keyword_search(
         "chunk_level = 'child'",
         "(metadata->>'scope' = 'global' OR "
         "(metadata->>'scope' = 'session' AND metadata->>'session_id' = :sid))",
-        "tsvec @@ plainto_tsquery('simple', :q)",
+        "tsvec @@ plainto_tsquery('russian', :q)",
     ]
     rows = await db.execute(
         text(f"""
         SELECT id, content, metadata, chunk_level, parent_id,
-               ts_rank(tsvec, plainto_tsquery('simple', :q)) AS score
+               ts_rank(tsvec, plainto_tsquery('russian', :q)) AS score
         FROM memories
         WHERE {" AND ".join(conds)}
         ORDER BY score DESC

@@ -65,10 +65,15 @@ async def _run_single(run_id: str, task: dict, config: str,
         # Только LLM, без RAG
         from app.agents.llm_client import get_llm
         from langchain_core.messages import SystemMessage, HumanMessage
+        from app.agents.react_agent import _skill_registry
+        from app.skills.prompt_builder import build_engineer_prompt
+
+        active = _skill_registry.active_slugs if _skill_registry else None
+        prompt_text = build_engineer_prompt(ENGINEER_PROMPT, _skill_registry, active)
         llm = get_llm("engineer", task_id=task_id, tool_name="baseline_gen")
-        from app.prompts.system_prompts import ENGINEER_PROMPT, BENCHMARK_PROMPT
+        from app.prompts.system_prompts import BENCHMARK_PROMPT
         prompt = BENCHMARK_PROMPT.format(description=desc, formal_spec=formal_spec)
-        resp = await llm.ainvoke([SystemMessage(content=ENGINEER_PROMPT),
+        resp = await llm.ainvoke([SystemMessage(content=prompt_text),
                                    HumanMessage(content=prompt)])
         code = resp.content
     else:

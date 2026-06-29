@@ -1,28 +1,10 @@
-﻿# Talos Harness
+# Talos Harness
 
-**Гибкий оркестратор агентов для индустриальной автоматизации**
+**Гибкий оркестратор агентов для генерации и верификации IEC 61131-3 ST-кода для ПЛК**
 
-Talos Harness — инфраструктурный каркас (harness), который соединяет агентов, модели, инструменты и память в единый workflow для автоматизации разработки ПО для ПЛК. Платформа подходит для генерации ST, валидации через MatIEC, RAG по документации и может быть адаптирована под другие языки и задачи.
+Talos Harness — инфраструктурный каркас (harness), соединяющий LLM-агентов, инструменты, RAG-память и валидатор в единый workflow. Генерирует Structured Text и PLCopen XML, валидирует через MatIEC, ищет контекст в документации через pgvector. Поддерживает динамическое подключение скиллов — модульных расширений, меняющих поведение агента.
 
-## Концепция
-
-Talos Harness построен вокруг двух принципов.
-
-### 1. Harness — оркестратор, а не монолит
-
-Вы не привязаны к конкретной модели, векторной БД или инструменту. Через `.env` можно заменить:
-
-- LLM (OpenRouter, LM Studio, любой OpenAI-compatible API)
-- эмбеддинги (llama.cpp GGUF, OpenRouter)
-- валидатор (MatIEC; в перспективе — PLCverif и др.)
-- стратегию чанкинга (сейчас recursive + parent-child в `app/tools/doc_indexer.py`)
-
-### 2. Два агента — одна цель
-
-- **Retrieval** (без LLM) — детерминированный сбор контекста: dense RAG, история чата, заметки о загрузке.
-- **Expert** (ReAct) — генерация ST/PLCopen XML, валидация MatIEC, итеративное исправление.
-
-Разделение даёт предсказуемый поиск, меньше вызовов LLM на этапе retrieval и независимую отладку компонентов.
+---
 
 ## Архитектура
 
@@ -30,78 +12,203 @@ Talos Harness построен вокруг двух принципов.
 User Query
     │
     ▼
-┌─────────────────────────────────────┐
-│  Retrieval (без LLM)                │
-│  dense RAG + история чата + upload  │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Skill Router (автоматический выбор)              │
+│  эмбеддинг запроса → cosine similarity            │
+│  с description скиллов → топ-3 > 0.45             │
+└──────────────────────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────────┐
-│  Expert (ReAct)                     │
-│  generate_st_code → validate_st     │
-│  итерации до EXPERT_MAX_ITERATIONS  │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Retrieval (без LLM)                             │
+│  dense + hybrid RAG (pgvector)                   │
+│  история чата + контекст загрузки                │
+└──────────────────────────────────────────────────┘
     │
     ▼
-  ST / PLCopen XML + MatIEC
+┌──────────────────────────────────────────────────┐
+│  Expert (ReAct)                                  │
+│  generate_st_code → validate_st (MatIEC)         │
+│  + выбранные скиллы (st-style-guide, …)          │
+│  итерации до EXPERT_MAX_ITERATIONS               │
+└──────────────────────────────────────────────────┘
+    │
+    ▼
+  ST / PLCopen XML + MatIEC verification
 ```
 
 | Компонент | Назначение |
-|-----------|------------|
-| **Retrieval** | Поиск по pgvector (`scope=global` + `scope=session`), последние сообщения чата, контекст загрузки |
-| **Expert** | ReAct-цикл: генерация ST/XML и валидация через MatIEC |
-| **MatIEC** | `iec2c` / `iec2iec` — синтаксис и компиляция |
-| **Эмбеддинги** | llama.cpp (GGUF) или OpenRouter API |
-| **LLM** | OpenRouter или LM Studio (OpenAI-compatible API) |
-| **Память** | PostgreSQL 17 + pgvector, персистентные сессии чатов |
+|-----------|-----------|
+| **Skill Router** | Автоматический выбор скиллов: эмбеддинг запроса → cosine similarity с `description` скиллов → топ-3 выше порога 0.45. Реализация: `app/skills/router.py` |
+| **Retrieval** | Детерминированный сбор контекста: dense RAG (pgvector, cosine), tsvector keyword search, RRF fusion, parent-child чанкинг |
+| **Expert** | ReAct-цикл: LLM + инструменты `generate_st_code` и `validate_st_syntax`, итеративное исправление по ошибкам MatIEC |
+| **Skills** | Динамически подключаемые модули: Markdown-промпты, опционально Python-инструменты. Активируются автоматически или вручную через API |
+| **MatIEC** | `iec2c` / `iec2iec` — синтаксическая валидация и компиляция ST-кода |
+| **Эмбеддинги** | llama.cpp (GGUF) локально или OpenRouter API |
+| **LLM** | OpenRouter / LM Studio (OpenAI-compatible). Поддерживаются любые модели |
+| **Память** | PostgreSQL 17 + pgvector, персистентные сессии чатов, parent-child документы |
 
-Документы из Gradio индексируются с `scope=session`; через API — `scope=global` (опционально `session_id`).
+Документы из UI индексируются с `scope=session`; через API — `scope=global`.
 
-Реализация графа: [`app/agents/react_agent.py`](app/agents/react_agent.py).
+---
 
-## Возможности и точки расширения
+## API Endpoints
 
-| Компонент | Что делает сейчас | Можно заменить / добавить |
-|-----------|-------------------|-------------------------|
-| **Retrieval** | Dense RAG + история чата | Гибридный поиск (BM25 + dense), reranking |
-| **Expert** | ST/XML + MatIEC | Другой целевой язык (LD, FBD), другой валидатор |
-| **Память** | pgvector, 768-dim | Qdrant, Milvus и др. (потребует адаптер в `app/memory/`) |
-| **Эмбеддинги** | llama.cpp (GGUF) | OpenRouter, локальные sentence-transformers |
-| **LLM** | OpenRouter / LM Studio | Любая OpenAI-compatible модель |
+### Agent
 
-## Ключевые сценарии
+| Method | Path | Описание |
+|--------|------|---------|
+| `POST` | `/chat` | ReAct-агент: генерация ST-кода по текстовому запросу. Body: `{ message, session_id?, skills? }` |
+| `POST` | `/generate_module` | Генерация ST-модуля (PROGRAM) по CSV-таблице сигналов |
+| `GET` | `/module/download` | Скачать сгенерированный `.st` файл |
+| `POST` | `/validate` | Валидация ST-кода через MatIEC |
 
-1. **Генерация ST по документации** — загрузка PDF/MD → индексация → запрос на естественном языке → код с валидацией.
-2. **PLCopen XML** — экспорт схем для обмена с CODESYS и совместимыми средами.
-3. **Валидация и исправление** — MatIEC находит ошибки, Expert перегенерирует код (до лимита итераций).
-4. **Модуль по таблице сигналов** — CSV/XLSX → VAR-секция и каркас PROGRAM.
-5. **Бенчмарк ST coding** — 10 промышленных задач IEC 61131-3, три режима (baseline / agent / RAG+чат), метрики MatIEC и RAG — см. [ST coding benchmark](#st-coding-benchmark).
-6. **Бенчмарк Agents4PLC** (опционально) — прогон задач через `benchmark/runner.py`.
+### Skills
+
+| Method | Path | Описание |
+|--------|------|---------|
+| `GET` | `/skills` | Список всех обнаруженных скиллов (статус, превью промпта) |
+| `GET` | `/skills/active` | Только активные скиллы |
+| `GET` | `/skills/{slug}` | Детальная информация: полный промпт, инструменты, зависимости |
+| `POST` | `/skills/{slug}/activate` | Активировать скилл (глобально) |
+| `POST` | `/skills/{slug}/deactivate` | Деактивировать скилл |
+| `POST` | `/skills/upload` | Загрузить `.md` файл скилла (multipart/form-data). Сохраняется в `app/skills/uploads/` |
+
+### Сессии и память
+
+| Method | Path | Описание |
+|--------|------|---------|
+| `GET` | `/sessions` | Список сессий (последние 50) |
+| `POST` | `/sessions` | Создать новую сессию. Body: `{ title }` |
+| `GET` | `/sessions/{id}/messages` | История сообщений сессии |
+| `PATCH` | `/sessions/{id}` | Переименовать сессию. Body: `{ title }` |
+| `GET` | `/memories/search` | Полнотекстовый + векторный поиск по документации. Query: `q`, `session_id?`, `top_k?` |
+
+### Документы
+
+| Method | Path | Описание |
+|--------|------|---------|
+| `POST` | `/upload_pdf` | Загрузить PDF/MD/TXT в память (global или session scope) |
+| `POST` | `/upload_signals` | Загрузить CSV таблицы сигналов |
+| `DELETE` | `/clear_documents` | Очистить документы сессии или глобальные |
+| `GET` | `/documents` | Список загруженных документов |
+
+### Бенчмарк
+
+| Method | Path | Описание |
+|--------|------|---------|
+| `POST` | `/benchmark/run` | Agents4PLC: прогон задач (easy/medium/hard) |
+| `POST` | `/benchmark/st_coding/run` | ST coding benchmark: 10 задач IA01–IA10 |
+| `GET` | `/benchmark/results` | Последние 50 результатов бенчмарков |
+
+### Мониторинг
+
+| Method | Path | Описание |
+|--------|------|---------|
+| `GET` | `/monitoring/tokens` | Статистика токенов по сессиям |
+| `GET` | `/monitoring/cost` | Стоимость вызовов LLM в USD |
+| `GET` | `/monitoring/cost/per_task` | Стоимость в разрезе benchmark-конфигов |
+| `GET` | `/monitoring/dashboard` | Plotly-дашборд (HTML) |
+
+### System
+
+| Method | Path | Описание |
+|--------|------|---------|
+| `GET` | `/health` | Проверка статуса всех сервисов |
+
+---
+
+## Skills Guide
+
+Skills — модульные расширения, которые динамически меняют поведение агента. Каждый скилл — директория с `SKILL.md` (YAML frontmatter + Markdown тело) и опциональным `tool.py` с Python-инструментами.
+
+### Встроенные скиллы (`app/skills/builtin/`)
+
+| Скилл | Назначение | Содержимое |
+|-------|-----------|-----------|
+| `st-style-guide` | Конвенции именования, типы данных, таймеры, формат ST/PLCopen XML | Извлечён из `ENGINEER_PROMPT` |
+| `matiec-st-guide` | Саммари ключевых правил совместимости с MatIEC (no `BEGIN`, strict typing, safe naming, debugging hints) | Извлечён из `IEC-61131-3-ST-GUIDE.md` |
+
+### Автоматический выбор (Skill Router)
+
+Если в запросе `POST /chat` не указано поле `skills`, система автоматически выбирает релевантные скиллы:
+
+1. Запрос пользователя эмбеддится через `embed_single()`
+2. Вычисляется cosine similarity с эмбеддингами `description` всех доступных скиллов
+3. Выбираются топ-3 скилла с similarity ≥ 0.45
+4. Если ничего не прошло порог — используются все доступные скиллы (fallback)
+
+**Ручной режим** (явно указанные скиллы отключает авто-роутинг):
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "FB для насоса", "skills": ["st-style-guide"]}'
+```
+
+### Загрузка своего скилла
+
+```bash
+curl -F "file=@my-skill.md" http://localhost:8000/skills/upload
+```
+
+Формат `SKILL.md`:
+```markdown
+---
+name: my-skill
+description: Use when working with specific PLC controllers...
+version: "1.0.0"
+has_tools: false
+---
+
+# My Skill
+
+Инструкции для агента...
+```
+
+Скилл с Python-инструментами (`tool.py`):
+```python
+from langchain_core.tools import tool
+
+@tool
+async def my_tool(param: str) -> str:
+    """Tool description."""
+    return f"Result: {param}"
+```
+
+### Механика
+
+При старте сессии (или первом запросе) `Skill Router` эмбеддит запрос и выбирает релевантные скиллы. Их Markdown-тело инжектится в system prompt агента. Если скилл имеет `tool.py` — инструменты регистрируются и становятся доступны LLM для вызова. Система полностью backward-compatible: при `skills_enabled=False` или пустом списке скиллов поведение идентично версии без скиллов.
+
+---
 
 ## Быстрый старт
 
 ```bash
 cp .env.example .env
-# Настройте LLM_BACKEND, модели и ключи (см. Конфигурация)
-# Положите GGUF эмбеддинга в ./models/ (EMBEDDING_GGUF_FILE в .env)
+# Настройте LLM_BACKEND, модели и ключи
+# Положите GGUF эмбеддинга в ./models/
 
 docker compose up --build -d
 ```
-
-После старта:
 
 | Сервис | URL |
 |--------|-----|
 | Gradio UI | http://localhost:7860 |
 | API (Swagger) | http://localhost:8000/docs |
-| Health | http://localhost:8000/health |
 | MatIEC | http://localhost:8001/health |
-| Мониторинг | http://localhost:8000/monitoring/dashboard |
 
-### LM Studio (локальный LLM)
+### Локальная разработка
 
-1. Загрузите модель в LM Studio, включите Local Server (порт 1234).
-2. В `.env`:
+```bash
+python -m venv .venv
+pip install -r requirements.txt
+docker compose up -d postgres matiec llama-embedding
+uvicorn app.main:app --reload --port 8000
+python -m ui.gradio_app
+```
+
+### LM Studio
 
 ```env
 LLM_BACKEND=lmstudio
@@ -111,229 +218,58 @@ AGENT_CONTEXT_LIMIT=32768
 AGENT_MAX_TOKENS=8192
 ```
 
-3. `docker compose up -d api ui`
+---
 
 ## Конфигурация (`.env`)
 
-| Переменная | Описание |
-|------------|----------|
-| `LLM_BACKEND` | `openrouter` \| `lmstudio` |
-| `OPENROUTER_API_KEY` | Ключ OpenRouter (LLM и OCR) |
-| `LMSTUDIO_BASE_URL` | URL LM Studio (`/v1`) |
-| `ENGINEER_MODEL` | Модель Expert и `generate_st_code` |
-| `EMBEDDING_BACKEND` | `local` (llama.cpp) \| `openrouter` |
-| `LLAMA_EMBEDDING_URL` | Docker: `http://llama-embedding:8080` |
-| `EXPERT_MAX_ITERATIONS` | Лимит шагов ReAct Expert (default 5) |
-| `TOP_K_RETRIEVAL` | Число parent-фрагментов в Retrieval (default 8) |
-| `CHUNKING_MODE` | `auto` \| `markdown` \| `recursive` — структурный чанкинг MD |
-| `RETRIEVAL_HYBRID_ENABLED` | Dense + keyword (tsvector) через RRF |
-| `RETRIEVAL_DOC_MAX_CHARS` | Лимит символов документации в промпте (default 12000) |
-| `BENCHMARK_MAX_VALIDATION_ATTEMPTS` | Лимит `validate_st_syntax` в ST coding bench (default 2) |
-| `BENCHMARK_ST_GUIDE_PATH` | MD-гайд для RAG в бенчмарке |
+| Переменная | По умолчанию | Описание |
+|-----------|-------------|---------|
+| `LLM_BACKEND` | `openrouter` | `openrouter` или `lmstudio` |
+| `OPENROUTER_API_KEY` | — | Ключ OpenRouter |
+| `ENGINEER_MODEL` | `qwen/qwen3.6-27b` | Модель для Expert и `generate_st_code` |
+| `EMBEDDING_BACKEND` | `local` | `local` (llama.cpp) или `openrouter` |
+| `EXPERT_MAX_ITERATIONS` | `5` | Лимит шагов ReAct-цикла |
+| `SKILLS_ENABLED` | `true` | Включить систему скиллов |
+| `TOP_K_RETRIEVAL` | `8` | Число parent-фрагментов в Retrieval |
+| `RETRIEVAL_HYBRID_ENABLED` | `true` | Dense + keyword (tsvector) fusion |
+| `BENCHMARK_MAX_VALIDATION_ATTEMPTS` | `2` | Лимит `validate_st_syntax` в ST coding bench |
+| `OCR_BACKEND` | `openrouter` | `openrouter` или `paddle` |
 
-Полный список — в [`.env.example`](.env.example).
-
-### Миграция существующей БД
-
-```bash
-docker exec -i plc_postgres psql -U plc -d plc_agent < scripts/migrate_memory_sessions.sql
-docker exec -i plc_postgres psql -U plc -d plc_agent < scripts/migrate_benchmark_metrics.sql
-```
-
-## Использование
-
-### Чат-агент (Gradio)
-
-Список чатов в sidebar, загрузка PDF/MD/TXT в память текущей сессии, потоковый лог Retrieval + Expert.
-
-### Чат через API
-
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Напиши FB для управления насосом с защитой от сухого хода", "session_id": "uuid-опционально"}'
-```
-
-### Сессии чатов
-
-```bash
-curl http://localhost:8000/sessions
-curl -X POST http://localhost:8000/sessions -H "Content-Type: application/json" -d '{"title":"Новый чат"}'
-curl http://localhost:8000/sessions/{id}/messages
-```
-
-### Загрузка документации (global)
-
-```bash
-curl -F "file=@manual.pdf" "http://localhost:8000/upload_pdf?doc_type=elbrus_manual"
-curl "http://localhost:8000/memories/search?q=TON&session_id=&top_k=5"
-```
-
-### Генерация модуля по сигналам
-
-```bash
-curl -F "file=@signals.csv" "http://localhost:8000/upload_signals?controller=elbrus"
-curl -X POST http://localhost:8000/generate_module \
-  -H "Content-Type: application/json" \
-  -d '{"controller":"elbrus","signals_path":"/app/uploads/signals_XXX.csv"}'
-```
-
-### Бенчмарк Agents4PLC (опционально)
-
-```bash
-git clone https://github.com/Luoji-zju/Agents4PLC_release benchmark/Agents4PLC_release
-
-curl -X POST http://localhost:8000/benchmark/run \
-  -H "Content-Type: application/json" \
-  -d '{"subset":"medium","n_tasks":10,"configs":["baseline","full_agent"]}'
-```
-
-### ST coding benchmark
-
-Набор из 10 задач промышленной автоматизации (`benchmark/st_coding_bench.json`, IA01–IA10). Один запуск = **одна config × n задач**. Полное сравнение трёх режимов — три отдельных прогона.
-
-| Config | Описание |
-|--------|----------|
-| `baseline` | LLM + `ENGINEER_PROMPT`, без агента и RAG; новая session на задачу; MatIEC только post-hoc для метрики |
-| `agent_isolated` | ReAct + MatIEC; **новая session на задачу**; RAG по **global**-индексу ST-гайда |
-| `agent_single_session` | ReAct + MatIEC; **один чат** на все задачи; session-scoped гайд; история (последние 5 сообщений) в retrieval |
-
-**Метрики:** `compilation_ok` (accuracy через MatIEC), `pass_at_1`, latency, tokens/cost, `validation_attempts`, RAG (`guide_hit_rate`, `retrieval_top1_score`). Результаты — в `benchmark_results` и JSON `benchmark/st_coding_run_<config>.json`.
-
-**Запуск (Docker):**
-
-```bash
-docker exec plc_api python /app/benchmark/run_full_bench.py --config baseline
-docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_isolated
-docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_single_session
-```
-
-**Продолжение прерванного прогона:**
-
-```bash
-# single-session: тот же чат и run_id, пропуск выполненных задач
-docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_single_session --resume
-
-# isolated: явно с нужной задачи (у каждой задачи свой session_id)
-docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_isolated \
-  --resume --start-task IA09 --run-id <uuid-прогона>
-```
-
-**Экспорт полного JSON из БД** (после нескольких resume-пакетов):
-
-```bash
-docker exec plc_api python /app/benchmark/run_full_bench.py --config agent_single_session \
-  --export-run-id <uuid-прогона>
-```
-
-**API:**
-
-```bash
-curl -X POST http://localhost:8000/benchmark/st_coding/run \
-  -H "Content-Type: application/json" \
-  -d '{"config":"agent_isolated","n_tasks":10,"max_validation_attempts":2}'
-
-curl http://localhost:8000/benchmark/results
-```
-
-ST-гайд для RAG: [`benchmark/assets/IEC-61131-3-ST-GUIDE.md`](benchmark/assets/IEC-61131-3-ST-GUIDE.md).
-
-### Индексация и retrieval (MD)
-
-- **Markdown-aware chunking:** для `.md` и `doc_type=iec_standard` документ режется по заголовкам `###` (parent), child — подразделы, таблицы и code blocks целиком.
-- **Parent-child RAG:** поиск по child-эмбеддингам, в контекст LLM — parent-разделы.
-- **Hybrid search:** cosine (pgvector) + `tsvector` (config `simple`), fusion через RRF.
-- Тесты чанкера: `python tests/test_markdown_chunker.py`
-
-## MatIEC
-
-Сборка образа (форк [sm1820/matiec](https://github.com/sm1820/matiec)):
-
-```bash
-docker compose build matiec
-docker compose up -d matiec
-curl http://localhost:8001/health
-```
-
-Проверка валидации:
-
-```bash
-curl -X POST http://localhost:8001/validate \
-  -H "Content-Type: application/json" \
-  -d '{"code":"PROGRAM Test\nVAR x: BOOL; END_VAR\nx := TRUE;\nEND_PROGRAM","task_id":"test"}'
-```
-
-Ожидается `ok: true`. При ошибке `lib/ieclib.txt` пересоберите `matiec` — для `iec2iec` в `matiec_server.py` передаётся `-I /usr/local/lib/matiec/`.
-
-## Локальная разработка
-
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-
-docker compose up -d postgres matiec llama-embedding
-
-uvicorn app.main:app --reload --port 8000
-python -m ui.gradio_app
-```
-
-После изменения `.env` перезапустите процессы — `get_settings()` кэшируется при старте.
+---
 
 ## Структура проекта
 
 ```
 app/
-  agents/      — LangGraph Retrieval + Expert, LLM-клиент
-  api/         — REST-маршруты (agent, documents, sessions, memory, benchmark)
-  memory/      — pgvector RAG, сессии чатов
-  monitoring/  — учёт токенов
-  prompts/     — системные промпты
-  tools/       — MatIEC, PDF/OCR, индексация документов
-ui/            — Gradio (список чатов + агент)
-benchmark/     — ST coding bench (st_coding_bench.json, runner), Agents4PLC runner
-scripts/       — init_db.sql, migrate_memory_sessions.sql, migrate_benchmark_metrics.sql
-matiec/        — MatIEC HTTP-сервис
-models/        — GGUF-файлы эмбеддинга (не в git)
+  agents/        — LangGraph: Retrieval + Expert, LLM-клиент
+  api/           — REST-маршруты (8 модулей: agent, skills, sessions, ...)
+  memory/        — pgvector RAG, гибридный поиск, сессии чатов
+  monitoring/    — учёт токенов и стоимости
+  prompts/       — системные промпты (BASE_EXPERT_PROMPT, ENGINEER_PROMPT, ...)
+  skills/        — ядро системы скиллов
+    builtin/     — встроенные скиллы (st-style-guide, matiec-st-guide)
+    uploads/     — загруженные через API скиллы
+  tools/         — MatIEC, PDF/OCR, эмбеддинги, чанкинг
+ui/              — Gradio UI
+benchmark/       — ST coding bench (10 задач IA01–IA10), Agents4PLC runner
+matiec/          — MatIEC HTTP-сервис (Docker)
+scripts/         — SQL миграции
+models/          — GGUF-файлы эмбеддинга (не в git)
 ```
 
-## Для кого это
+---
+
+## Для кого
 
 | Кто | Зачем |
 |-----|-------|
-| Инженеры-автоматизаторы | Быстрые шаблоны и прототипы кода для ПЛК |
-| AI/ML-инженеры | Агентные workflow, RAG, оркестрация LangGraph |
+| Инженеры-автоматизаторы | Быстрые прототипы кода для ПЛК с валидацией |
+| AI/ML-инженеры | Агентные workflow, RAG, LangGraph, скиллы |
 | Исследователи | Эксперименты с генерацией и верификацией PLC-кода |
 | Студенты | Пример production-oriented агентной системы на Python |
 
-## Дорожная карта
-
-- Поддержка LD и FBD, углублённая интеграция с CODESYS
-- Гибридный поиск (dense + sparse), Cross-Encoder reranking
-- Адаптеры памяти под внешние vector DB
-- Расширяемый набор инструментов Expert (PLCverif, симуляция)
-
-## Почему Harness
-
-**Harness** — упряжь и каркас: система, которая связывает компоненты в единое целое и направляет их на задачу. Talos Harness оркестрирует агентов, модели и инструменты; домен PLC/ST — текущая реализация, а не жёсткое ограничение платформы.
-
-## Ключевые отличия
-
-| Решение | Ограничение | Роль Talos Harness |
-|---------|-------------|-------------------|
-| Универсальные copilot / LLM | Слабая специализация на IEC 61131-3 | ST/XML, MatIEC, RAG по мануалам |
-| Классические IDE ПЛК | Шаблоны без семантического поиска | Контекст из документации и истории чата |
-| Только валидаторы (PLCverif и др.) | Проверка без генерации | Генерация + валидация в одном workflow |
-
-## Документация
-
-- [API Reference](http://localhost:8000/docs) (после запуска)
+---
 
 ## Лицензия
 
-Планируется Apache 2.0 — свободное использование и модификация с указанием авторства.
-
-## Контрибьютинг
-
-Приветствуются PR: новые tools для Expert, улучшения Retrieval, интеграции с IDE, поддержка других языков ПЛК. Обсуждение — через Issues репозитория.
+Apache 2.0

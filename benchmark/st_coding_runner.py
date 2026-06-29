@@ -1,4 +1,4 @@
-﻿"""
+"""
 benchmark/st_coding_runner.py — Прогон ST coding benchmark (st_coding_bench.json).
 
 Configs:
@@ -219,6 +219,11 @@ async def _save_chat_turn(db, session_id: str, user_text: str, assistant_text: s
 
 
 async def _run_baseline(task: dict, session_id: str) -> tuple[str, dict]:
+    from app.agents.react_agent import _skill_registry
+    from app.skills.prompt_builder import build_engineer_prompt
+
+    active = _skill_registry.active_slugs if _skill_registry else None
+    prompt_text = build_engineer_prompt(ENGINEER_PROMPT, _skill_registry, active)
     llm = get_llm(
         "engineer",
         session_id=session_id,
@@ -231,7 +236,7 @@ async def _run_baseline(task: dict, session_id: str) -> tuple[str, dict]:
         "Выведи только ST-код без пояснений."
     )
     resp = await llm.ainvoke([
-        SystemMessage(content=ENGINEER_PROMPT),
+        SystemMessage(content=prompt_text),
         HumanMessage(content=prompt),
     ])
     code = resp.content if isinstance(resp.content, str) else str(resp.content)

@@ -1,4 +1,4 @@
-﻿from typing import Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -6,12 +6,14 @@ from pydantic import BaseModel, Field
 class ChatRequest(BaseModel):
     message: str = Field(..., description="Запрос пользователя на естественном языке")
     session_id: Optional[str] = Field(None, description="UUID сессии; если не задан — создаётся автоматически")
+    skills: Optional[list[str]] = Field(None, description="Список скиллов для активации в этом запросе")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "message": "Напиши функциональный блок для управления насосом с защитой от сухого хода",
                 "session_id": None,
+                "skills": None,
             }
         }
 
@@ -127,3 +129,38 @@ class StCodingBenchRunRequest(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     checks: dict[str, str]
+
+
+# ---- Skills ----
+
+class SkillInfo(BaseModel):
+    slug: str
+    name: str
+    version: str
+    description: str
+    has_tools: bool
+    has_nodes: bool
+    active: bool
+    legacy: bool = False
+    prompt_preview: str = ""
+
+
+class SkillDetail(SkillInfo):
+    license: str = ""
+    depends_on: list[str] = []
+    tools: list[str] = []
+    prompt_body: str = ""
+
+
+class SkillActivateResponse(BaseModel):
+    slug: str
+    active: bool
+    message: str
+
+
+class SkillUploadResponse(BaseModel):
+    slug: str
+    name: str
+    description: str
+    version: str
+    message: str
