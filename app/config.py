@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     lmstudio_api_key: str = "lm-studio"
 
     # Models
-    planner_model: str   = "qwen/qwen3.6-27b"
-    engineer_model: str  = "qwen/qwen3.6-27b"
-    retriever_model: str = "qwen/qwen3.6-27b"
+    planner_model: str   = "qwen3.6-27b"
+    engineer_model: str  = "qwen3.6-27b"
+    retriever_model: str = "qwen3.6-27b"
     embedding_backend: str = "local"  # local (llama.cpp GGUF) | openrouter
     embedding_model: str = "embeddinggemma-300m"
     embedding_dimensions: int = 768
@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     # Pricing USD per 1M tokens (OpenRouter, June 2026)
     model_pricing: dict = {
         "nex-agi/nex-n2-pro":     {"input": 0.0,  "output": 0.0},
-        "qwen/qwen3.6-27b":       {"input": 0.0,  "output": 0.0},
+        "qwen3.6-27b":             {"input": 0.0,  "output": 0.0},
         "openai/gpt-oss-120b":    {"input": 0.0,  "output": 0.0},
         "qwen/qwen3.5-9b":        {"input": 0.1,  "output": 0.2},
         "qwen/qwen3.5-4b":        {"input": 0.05, "output": 0.1},

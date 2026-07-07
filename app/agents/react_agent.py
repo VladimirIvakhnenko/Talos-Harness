@@ -269,6 +269,18 @@ def _expert_system(state: AgentState) -> str:
             pass
     base += f"\n\nTools: {', '.join(tool_names)}."
 
+    base += (
+        "\n\n=== OUTPUT FORMAT ===\n"
+        "When you need to call a tool, output EXACTLY this format:\n"
+        "Action: tool_name\n"
+        "Action Input: {'param': 'value'}\n"
+        "Example:\n"
+        "Action: generate_st_code\n"
+        "Action Input: {'spec': '...', 'controller': 'elbrus'}\n\n"
+        "When the task is complete, respond with just your final answer.\n"
+        "Never use 'Action:' or 'Action Input:' in your final answer."
+    )
+
     parts = [base]
     req = state.get("user_request", "")
     if req:
@@ -313,6 +325,41 @@ def _expert_system(state: AgentState) -> str:
     return "\n\n".join(parts)
 
 
+def _parse_tool_calls(text: str) -> list[dict]:
+    """Parse ReAct-style tool calls from LLM text response.
+
+    Expects lines in the form:
+      Action: tool_name
+      Action Input: {"param": "value"} or {'param': 'value'}
+    Returns list of dicts with name/args/id keys.
+    """
+    import ast
+    import json
+    import re
+
+    results: list[dict] = []
+    pattern = re.compile(
+        r"Action:\s*(\w[\w-]*)\s*\n\s*Action Input:\s*(\{.*?\}|\[.*?\]|`[^`]+`)",
+        re.DOTALL,
+    )
+    for match in pattern.finditer(text):
+        name = match.group(1)
+        raw = match.group(2).strip().strip("`")
+        try:
+            args = json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                args = ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                args = {"input": raw}
+        results.append({
+            "name": name,
+            "args": args if isinstance(args, dict) else {"input": str(args)},
+            "id": f"call_{name}_{len(results)}",
+        })
+    return results
+
+
 async def expert_planner_node(state: AgentState) -> AgentState:
     _log_node(state, "expert_planner")
     llm = get_llm(
@@ -321,16 +368,15 @@ async def expert_planner_node(state: AgentState) -> AgentState:
         task_id=state.get("task_id"),
         react_step="thought",
     )
-    # Combine base tools with skill tools
-    all_tools = list(EXPERT_TOOLS)
-    if _skill_registry:
-        try:
-            all_tools.extend(_skill_registry.active_tools())
-        except Exception:
-            pass
-    llm_with_tools = llm.bind_tools(all_tools)
     msgs = [SystemMessage(content=_expert_system(state))] + state["messages"]
-    resp = await llm_with_tools.ainvoke(msgs)
+    resp = await llm.ainvoke(msgs)
+    text = _content_str(resp.content)
+
+    tool_calls = _parse_tool_calls(text)
+    if tool_calls:
+        from langchain_core.messages import AIMessage
+        resp = AIMessage(content=text, tool_calls=tool_calls)
+
     return {**state, "messages": state["messages"] + [resp]}
 
 
@@ -688,6 +734,10 @@ async def stream_agent(
     final_state: dict = {}
     all_messages: list = []
 
+    # Clear stale token data from previous runs
+    from app.monitoring.token_tracker import drain_cycle_tokens
+    drain_cycle_tokens()
+
     initial_state = _build_initial_state(user_message, sid, task_id, context, skills=skills)
     all_messages = list(initial_state["messages"])
 
@@ -732,9 +782,19 @@ async def run_agent(
     context: str | None = None,
     max_validation_attempts: int | None = None,
     skills: list[str] | None = None,
+    route_skills: bool = False,
 ) -> dict:
     sid = session_id or str(uuid.uuid4())
     graph = get_graph()
+
+    # If skill routing requested, auto-select skills via cosine similarity
+    if route_skills and _skill_registry:
+        from app.skills.router import route_skills as do_route
+
+        selected = await do_route(user_message, _skill_registry)
+        if selected:
+            skills = selected
+            logger.info("Routed skills for benchmark: %s", selected)
 
     initial_state = _build_initial_state(
         user_message, sid, task_id, context, max_validation_attempts, skills=skills

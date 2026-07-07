@@ -1,16 +1,10 @@
-﻿"""ST coding benchmark — один прогон на одну config (10 задач).
+"""ST coding benchmark — один прогон на одну config (10 задач).
 
 Примеры:
-  python benchmark/run_full_bench.py --config baseline
-  python benchmark/run_full_bench.py --config agent_isolated
-  python benchmark/run_full_bench.py --config agent_single_session
-
-Продолжить прерванный single-session прогон в том же чате:
-  python benchmark/run_full_bench.py --config agent_single_session --resume
-  python benchmark/run_full_bench.py --config agent_single_session \\
-      --session-id 1d154fc2-b429-4f16-8db9-6786778837df --start-task IA06
-
-Три полных сравнения = три отдельных запуска (30 прогонов суммарно).
+  python benchmark/run_full_bench.py --config vanilla_llm
+  python benchmark/run_full_bench.py --config rag_only
+  python benchmark/run_full_bench.py --config rag_skills
+  python benchmark/run_full_bench.py --config rag_skill_router
 """
 from __future__ import annotations
 
@@ -34,7 +28,7 @@ def _parse_args() -> argparse.Namespace:
         "--config",
         required=True,
         choices=ALL_CONFIGS,
-        help="Режим прогона: baseline | agent_isolated | agent_single_session",
+        help="Режим прогона: vanilla_llm | rag_only | rag_skills | rag_skill_router",
     )
     p.add_argument("--n-tasks", type=int, default=10, help="Число задач из st_coding_bench.json")
     p.add_argument("--max-validation-attempts", type=int, default=2)
@@ -50,9 +44,10 @@ def _parse_args() -> argparse.Namespace:
         help="Продолжить последний прогон: тот же session_id/run_id, пропустить выполненные задачи",
     )
     p.add_argument(
-        "--session-id",
-        default=None,
-        help="UUID сессии для agent_single_session (история чата сохраняется)",
+        "--route-skills",
+        action="store_true",
+        dest="route_skills",
+        help="Автоматический выбор скиллов через cosine similarity (для rag_skill_router)",
     )
     p.add_argument(
         "--run-id",
@@ -103,8 +98,6 @@ async def main() -> None:
     print(f"Tasks: {args.n_tasks}, max_validation_attempts: {args.max_validation_attempts}", flush=True)
     if args.resume:
         print("Resume: enabled (same chat session)", flush=True)
-    if args.session_id:
-        print(f"Session: {args.session_id}", flush=True)
     if args.start_task_id:
         print(f"Start task: {args.start_task_id}", flush=True)
 
@@ -114,7 +107,6 @@ async def main() -> None:
             config=args.config,
             guide_path=args.guide_path,
             max_validation_attempts=args.max_validation_attempts,
-            session_id=args.session_id,
             run_id=args.run_id,
             start_task_id=args.start_task_id,
             resume=args.resume,

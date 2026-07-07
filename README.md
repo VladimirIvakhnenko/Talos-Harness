@@ -226,7 +226,7 @@ AGENT_MAX_TOKENS=8192
 |-----------|-------------|---------|
 | `LLM_BACKEND` | `openrouter` | `openrouter` или `lmstudio` |
 | `OPENROUTER_API_KEY` | — | Ключ OpenRouter |
-| `ENGINEER_MODEL` | `qwen/qwen3.6-27b` | Модель для Expert и `generate_st_code` |
+| `ENGINEER_MODEL` | `qwen3.6-27b` | Модель для Expert и `generate_st_code` |
 | `EMBEDDING_BACKEND` | `local` | `local` (llama.cpp) или `openrouter` |
 | `EXPERT_MAX_ITERATIONS` | `5` | Лимит шагов ReAct-цикла |
 | `SKILLS_ENABLED` | `true` | Включить систему скиллов |

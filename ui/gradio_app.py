@@ -1,4 +1,4 @@
-﻿"""
+"""
 ui/gradio_app.py — Gradio UI: список чатов + чат-агент + вложение файла.
 
 Запуск: python -m ui.gradio_app
@@ -36,6 +36,15 @@ def _file_path(file) -> str | None:
 
 def _session_choices(sessions: list[dict]) -> list[tuple[str, str]]:
     return [(s.get("title") or "Без названия", s["id"]) for s in sessions]
+
+
+def _fmt_tokens(tok: dict) -> str:
+    cost_str = f"${tok['cost_usd']:.6f}" if tok["cost_usd"] else "free"
+    return (
+        f"⚡ prompt: **{tok['prompt_tokens']}** · "
+        f"completion: **{tok['completion_tokens']}** · "
+        f"{cost_str}"
+    )
 
 
 def _format_doc_event(ev: dict) -> str:
@@ -106,7 +115,7 @@ async def init_ui():
             sid = sessions[0]["id"]
         history = await load_chat_history(db, sid)
     choices = _session_choices(sessions)
-    return gr.update(choices=choices, value=sid), sid, history
+    return gr.update(choices=choices, value=sid), sid, history, ""
 
 
 async def switch_chat(session_id: str):
@@ -114,17 +123,17 @@ async def switch_chat(session_id: str):
         return [], ""
     async with get_db() as db:
         history = await load_chat_history(db, session_id)
-    return history, session_id
+    return history, session_id, ""
 
 
 async def new_chat():
     async with get_db() as db:
         sid = await create_session(db)
         sessions = await list_sessions(db, limit=50)
-    return gr.update(choices=_session_choices(sessions), value=sid), sid, []
+    return gr.update(choices=_session_choices(sessions), value=sid), sid, [], ""
 
 
-async def chat_fn(message: str, file, history: list, session_id: str):
+async def chat_fn(message: str, file, history: list, session_id: str, token_html: str = ""):
     path = _file_path(file)
     user_display = message if message else (f"📎 {Path(path).name}" if path else "")
     if not user_display and not path:
@@ -140,7 +149,7 @@ async def chat_fn(message: str, file, history: list, session_id: str):
 
     history.append({"role": "user", "content": user_display})
     history.append({"role": "assistant", "content": "⏳ Обработка…"})
-    yield history, sid, None, gr.update()
+    yield history, sid, None, gr.update(), ""
 
     try:
         if path:
@@ -187,7 +196,7 @@ async def chat_fn(message: str, file, history: list, session_id: str):
                         history = _patch_assistant(
                             history, _assistant_content(ingest_log, "")
                         )
-                        yield history, sid, None, gr.update()
+                        yield history, sid, None, gr.update(), ""
             else:
                 ctx = await _ingest_non_pdf(path)
                 ingest_log = [f"**Файл** {ctx[:500]}{'…' if len(ctx) > 500 else ''}"]
@@ -195,14 +204,14 @@ async def chat_fn(message: str, file, history: list, session_id: str):
                 history = _patch_assistant(
                     history, _assistant_content(ingest_log, "")
                 )
-                yield history, sid, None, gr.update()
+                yield history, sid, None, gr.update(), ""
 
         task_context = "\n\n".join(context_parts) if context_parts else None
 
         history = _patch_assistant(
             history, _assistant_content(ingest_log, "**Агент** запуск…")
         )
-        yield history, sid, None, gr.update()
+        yield history, sid, None, gr.update(), ""
 
         async for agent_partial in stream_agent(
             message,
@@ -213,7 +222,10 @@ async def chat_fn(message: str, file, history: list, session_id: str):
             history = _patch_assistant(
                 history, _assistant_content(ingest_log, agent_partial)
             )
-            yield history, sid, None, gr.update()
+            from app.monitoring.token_tracker import drain_cycle_tokens
+            tok = drain_cycle_tokens()
+            tok_line = _fmt_tokens(tok) if tok.get("calls") else ""
+            yield history, sid, None, gr.update(), tok_line
 
         persisted = persist_text_from_agent_log(agent_log) if agent_log else "Готово."
         async with get_db() as db:
@@ -225,18 +237,19 @@ async def chat_fn(message: str, file, history: list, session_id: str):
             await touch_session(db, sid)
             if ti == 0 and message.strip():
                 await rename_session(db, sid, message.strip()[:60])
+
             sessions = await list_sessions(db, limit=50)
 
         yield history, sid, None, gr.update(
             choices=_session_choices(sessions), value=sid
-        )
+        ), ""
 
     except Exception as e:
         history = _patch_assistant(
             history,
             _assistant_content(ingest_log, f"**Ошибка:** {type(e).__name__}: {e}"),
         )
-        yield history, sid, None, gr.update()
+        yield history, sid, None, gr.update(), ""
 
 
 def build_ui() -> gr.Blocks:
@@ -281,12 +294,18 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     send_btn = gr.Button("Отправить", variant="primary")
 
+                token_display = gr.Markdown(
+                    value="",
+                    visible=True,
+                    height=24,
+                )
+
         gr.Markdown(f"_{_FILE_HINT}_")
 
-        demo.load(init_ui, outputs=[chat_list, session_state, chatbot])
+        demo.load(init_ui, outputs=[chat_list, session_state, chatbot, token_display])
 
-        chat_outputs = [chatbot, session_state, file_input, chat_list]
-        chat_inputs = [msg_input, file_input, chatbot, session_state]
+        chat_outputs = [chatbot, session_state, file_input, chat_list, token_display]
+        chat_inputs = [msg_input, file_input, chatbot, session_state, token_display]
 
         send_btn.click(chat_fn, chat_inputs, chat_outputs).then(
             lambda: "", outputs=msg_input
@@ -295,8 +314,8 @@ def build_ui() -> gr.Blocks:
             lambda: "", outputs=msg_input
         )
 
-        chat_list.change(switch_chat, inputs=[chat_list], outputs=[chatbot, session_state])
-        new_chat_btn.click(new_chat, outputs=[chat_list, session_state, chatbot])
+        chat_list.change(switch_chat, inputs=[chat_list], outputs=[chatbot, session_state, token_display])
+        new_chat_btn.click(new_chat, outputs=[chat_list, session_state, chatbot, token_display])
 
     return demo
 

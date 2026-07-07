@@ -85,8 +85,8 @@ class BenchmarkRunRequest(BaseModel):
 
 class StCodingBenchRunRequest(BaseModel):
     config: str = Field(
-        "baseline",
-        description="Один режим прогона: baseline | agent_isolated | agent_single_session",
+        "vanilla_llm",
+        description="Один режим прогона: vanilla_llm | rag_only | rag_skills | rag_skill_router",
     )
     n_tasks: int = Field(10, ge=1, le=50, description="Количество задач из st_coding_bench.json")
     configs: Optional[list[str]] = Field(
@@ -98,9 +98,9 @@ class StCodingBenchRunRequest(BaseModel):
         description="Путь к ST-гайду (MD). По умолчанию benchmark/assets/IEC-61131-3-ST-GUIDE.md",
     )
     max_validation_attempts: int = Field(2, ge=1, le=10, description="Лимит попыток validate_st_syntax")
-    session_id: Optional[str] = Field(
-        None,
-        description="UUID сессии для agent_single_session — продолжение в том же чате",
+    route_skills: bool = Field(
+        False,
+        description="Автоматический выбор скиллов через cosine similarity (для rag_skill_router)",
     )
     run_id: Optional[str] = Field(
         None,

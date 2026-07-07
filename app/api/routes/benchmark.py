@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter
+from fastapi import APIRouter
 from sqlalchemy import text
 
 from app.api.schemas import BenchmarkRunRequest, StCodingBenchRunRequest
@@ -39,10 +39,8 @@ async def st_coding_benchmark_run(body: StCodingBenchRunRequest):
             configs=body.configs,
             guide_path=body.guide_path,
             max_validation_attempts=body.max_validation_attempts,
-            session_id=body.session_id,
             run_id=body.run_id,
             start_task_id=body.start_task_id,
-            resume=body.resume,
             db=db,
         )
     return result

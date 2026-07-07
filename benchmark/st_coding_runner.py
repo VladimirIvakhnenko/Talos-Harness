@@ -2,9 +2,10 @@
 benchmark/st_coding_runner.py — Прогон ST coding benchmark (st_coding_bench.json).
 
 Configs:
-  baseline              — LLM-only, новая session на задачу
-  agent_isolated        — ReAct + MatIEC, новая session, global guide
-  agent_single_session  — один chat + session-scoped guide + история
+  vanilla_llm       — LLM-only без RAG, без скиллов (нижний бейзлайн)
+  rag_only          — ReAct + RAG (векторный поиск), без скиллов
+  rag_skills        — ReAct + RAG + все builtin скиллы принудительно
+  rag_skill_router  — ReAct + RAG + авто-роутинг скиллов (флагман)
 """
 from __future__ import annotations
 
@@ -19,15 +20,15 @@ from sqlalchemy import text
 from app.agents.llm_client import embed_single, get_llm
 from app.agents.react_agent import extract_user_facing_response, run_agent
 from app.config import get_settings
-from app.prompts.system_prompts import ENGINEER_PROMPT
+from app.memory.sessions import ensure_session
 from app.tools.matiec_client import compile_st
 
 settings = get_settings()
 
 BENCH_FILE = Path(__file__).parent / "st_coding_bench.json"
 DEFAULT_GUIDE = Path(__file__).parent / "assets" / "IEC-61131-3-ST-GUIDE.md"
-VALID_CONFIGS = {"baseline", "agent_isolated", "agent_single_session"}
-ALL_CONFIGS = ["baseline", "agent_isolated", "agent_single_session"]
+VALID_CONFIGS = {"vanilla_llm", "rag_only", "rag_skills", "rag_skill_router"}
+ALL_CONFIGS = ["vanilla_llm", "rag_only", "rag_skills", "rag_skill_router"]
 
 
 def resolve_configs(
@@ -40,7 +41,7 @@ def resolve_configs(
     elif config:
         chosen = [config]
     else:
-        chosen = ["baseline"]
+        chosen = ["vanilla_llm"]
     unknown = set(chosen) - VALID_CONFIGS
     if unknown:
         raise ValueError(f"Unknown config(s): {sorted(unknown)}. Valid: {sorted(VALID_CONFIGS)}")
@@ -172,6 +173,10 @@ async def _index_guide(
 
 
 async def _aggregate_tokens(db, session_id: str, task_id: str) -> dict:
+    # Flush pending token rows first
+    from app.monitoring.token_tracker import flush_pending_tokens
+    await flush_pending_tokens(db, session_id, task_id)
+
     row = await db.execute(
         text("""
             SELECT
@@ -218,17 +223,13 @@ async def _save_chat_turn(db, session_id: str, user_text: str, assistant_text: s
     await save_chat_message(db, session_id, "assistant", assistant_text, emb_a, ti + 1)
 
 
-async def _run_baseline(task: dict, session_id: str) -> tuple[str, dict]:
-    from app.agents.react_agent import _skill_registry
-    from app.skills.prompt_builder import build_engineer_prompt
-
-    active = _skill_registry.active_slugs if _skill_registry else None
-    prompt_text = build_engineer_prompt(ENGINEER_PROMPT, _skill_registry, active)
+async def _run_vanilla_llm(task: dict, session_id: str) -> tuple[str, dict]:
+    """Чистый LLM вызов — без RAG, без скиллов, без engineer prompt."""
     llm = get_llm(
         "engineer",
         session_id=session_id,
         task_id=task["task_id"],
-        tool_name="baseline_gen",
+        tool_name="vanilla_llm",
     )
     prompt = (
         f"Реализуй IEC 61131-3 Structured Text по спецификации.\n\n"
@@ -236,7 +237,7 @@ async def _run_baseline(task: dict, session_id: str) -> tuple[str, dict]:
         "Выведи только ST-код без пояснений."
     )
     resp = await llm.ainvoke([
-        SystemMessage(content=prompt_text),
+        SystemMessage(content="Ты — эксперт IEC 61131-3. Сгенерируй ST-код."),
         HumanMessage(content=prompt),
     ])
     code = resp.content if isinstance(resp.content, str) else str(resp.content)
@@ -247,12 +248,16 @@ async def _run_agent_task(
     task: dict,
     session_id: str,
     max_validation_attempts: int,
+    skills: list[str] | None = None,
+    route_skills: bool = False,
 ) -> tuple[str | None, dict]:
     agent_result = await run_agent(
         task["prompt"],
         session_id=session_id,
         task_id=task["task_id"],
         max_validation_attempts=max_validation_attempts,
+        skills=skills,
+        route_skills=route_skills,
     )
     code = agent_result.get("final_code")
     return code, agent_result
@@ -268,16 +273,19 @@ async def _run_single(
     guide_name: str,
     db,
     persist_chat: bool,
+    skills: list[str] | None = None,
+    route_skills: bool = False,
 ) -> dict:
     task_id = task["task_id"]
     t0 = time.perf_counter()
 
-    if config == "baseline":
-        code, agent_meta = await _run_baseline(task, session_id)
+    if config == "vanilla_llm":
+        code, agent_meta = await _run_vanilla_llm(task, session_id)
         resolved_task_id = task_id
     else:
         code, agent_meta = await _run_agent_task(
-            task, session_id, max_validation_attempts
+            task, session_id, max_validation_attempts,
+            skills=skills, route_skills=route_skills,
         )
         resolved_task_id = agent_meta.get("task_id") or task_id
 
@@ -288,7 +296,7 @@ async def _run_single(
     compilation_ok = compile_result.ok
 
     retrieval_ctx = agent_meta.get("retrieval_context") or {}
-    rag = _rag_metrics(retrieval_ctx, guide_name) if config != "baseline" else {}
+    rag = _rag_metrics(retrieval_ctx, guide_name) if config != "vanilla_llm" else {}
 
     validation_attempts = agent_meta.get("validation_attempts", 0)
     generate_attempts = agent_meta.get("generate_attempts", 0)
@@ -306,7 +314,7 @@ async def _run_single(
         ),
     }
 
-    if persist_chat and config != "baseline" and db:
+    if persist_chat and config != "vanilla_llm" and db:
         assistant_text = extract_user_facing_response([], agent_meta)
         await _save_chat_turn(db, session_id, task["prompt"], assistant_text)
 
@@ -435,10 +443,10 @@ def _compute_summary(results: list[dict]) -> dict:
             ) if b["top1_count"] else 0.0,
         }
 
-    if "baseline" in summary and "agent_single_session" in summary:
+    if "vanilla_llm" in summary and "rag_skill_router" in summary:
         summary["rag_lift_pct"] = round(
-            summary["agent_single_session"]["accuracy_pct"]
-            - summary["baseline"]["accuracy_pct"],
+            summary["rag_skill_router"]["accuracy_pct"]
+            - summary["vanilla_llm"]["accuracy_pct"],
             1,
         )
     return summary
@@ -566,7 +574,7 @@ async def run_st_coding_benchmark(
     if resume:
         if not resume_ctx and not session_id:
             return {
-                "error": "Nothing to resume: no prior agent_single_session run with session_id in DB",
+                "error": "Nothing to resume: no prior run with session_id in DB",
                 "config": config_name,
             }
         if resume_ctx and not start_task_id:
@@ -592,31 +600,22 @@ async def run_st_coding_benchmark(
     guide_name = guide.name
     run_id = run_id or str(uuid.uuid4())
     all_results: list[dict] = []
-    active_session_id: str | None = session_id if config_name == "agent_single_session" else None
 
     for cfg in resolved_configs:
-        if cfg == "agent_single_session":
-            from app.memory.sessions import ensure_session
-
-            sid = session_id or str(uuid.uuid4())
-            sid = await ensure_session(db, sid, title="ST coding benchmark")
-            active_session_id = sid
-            if not await _session_has_guide(db, sid, guide_name):
-                await _index_guide(db, guide, session_id=sid, scope="session")
-            for task in tasks:
-                row = await _run_single(
-                    run_id, task, cfg,
-                    session_id=sid,
-                    max_validation_attempts=max_va,
-                    guide_name=guide_name,
-                    db=db,
-                    persist_chat=True,
-                )
-                all_results.append(row)
-        elif cfg == "agent_isolated":
+        if cfg in {"rag_only", "rag_skills", "rag_skill_router"}:
             await _index_guide(db, guide, session_id=None, scope="global")
             for task in tasks:
-                sid = str(uuid.uuid4())
+                skills_list: list[str] | None = None
+                route_skills_flag = False
+
+                if cfg == "rag_skills":
+                    from app.agents.react_agent import _skill_registry
+                    if _skill_registry:
+                        skills_list = _skill_registry.get_available_slugs()
+                elif cfg == "rag_skill_router":
+                    route_skills_flag = True
+
+                sid = await ensure_session(db, str(uuid.uuid4()), title="ST coding benchmark")
                 row = await _run_single(
                     run_id, task, cfg,
                     session_id=sid,
@@ -624,11 +623,14 @@ async def run_st_coding_benchmark(
                     guide_name=guide_name,
                     db=db,
                     persist_chat=False,
+                    skills=skills_list,
+                    route_skills=route_skills_flag,
                 )
                 all_results.append(row)
         else:
+            # vanilla_llm — no guide, no RAG, direct LLM
             for task in tasks:
-                sid = str(uuid.uuid4())
+                sid = await ensure_session(db, str(uuid.uuid4()), title="ST coding benchmark")
                 row = await _run_single(
                     run_id, task, cfg,
                     session_id=sid,
@@ -646,7 +648,7 @@ async def run_st_coding_benchmark(
         "suite": "st_coding",
         "config": resolved_configs[0] if len(resolved_configs) == 1 else None,
         "configs": resolved_configs,
-        "session_id": active_session_id,
+        "session_id": None,
         "resumed": bool(resume or start_task_id or session_id),
         "skipped_task_ids": resumed_from,
         "task_ids_run": [t["task_id"] for t in tasks],
