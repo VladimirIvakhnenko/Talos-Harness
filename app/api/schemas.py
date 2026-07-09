@@ -8,14 +8,10 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="UUID сессии; если не задан — создаётся автоматически")
     skills: Optional[list[str]] = Field(None, description="Список скиллов для активации в этом запросе")
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "message": "Напиши функциональный блок для управления насосом с защитой от сухого хода",
-                "session_id": None,
-                "skills": None,
-            }
-        }
+
+class EnqueueRequest(BaseModel):
+    session_id: str = Field(..., description="UUID сессии")
+    message: str = Field("", description="Текст сообщения (пусто для cancel)")
 
 
 class ChatResponse(BaseModel):

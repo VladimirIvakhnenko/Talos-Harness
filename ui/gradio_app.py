@@ -134,6 +134,8 @@ async def new_chat():
 
 
 async def chat_fn(message: str, file, history: list, session_id: str, token_html: str = ""):
+    from app.agents.cancellation import AgentRunner
+
     path = _file_path(file)
     user_display = message if message else (f"📎 {Path(path).name}" if path else "")
     if not user_display and not path:
@@ -146,6 +148,27 @@ async def chat_fn(message: str, file, history: list, session_id: str, token_html
 
     async with get_db() as db:
         sid = await ensure_session(db, session_id or None)
+
+    runner = AgentRunner.get(sid)
+
+    async def _run_agent(msg: str, ctx: str | None = None) -> str:
+        nonlocal agent_log
+        agent_log = ""
+        async for agent_partial in stream_agent(msg, session_id=sid, context=ctx):
+            agent_log = agent_partial
+            yield agent_partial
+
+    async def _persist(msg: str, display: str, log: str):
+        persisted = persist_text_from_agent_log(log) if log else "Готово."
+        async with get_db() as db:
+            ti = await next_turn_index(db, sid)
+            emb_u = await embed_single(display)
+            await save_chat_message(db, sid, "user", display, emb_u, ti)
+            emb_a = await embed_single(persisted[:4000] or " ")
+            await save_chat_message(db, sid, "assistant", persisted, emb_a, ti)
+            await touch_session(db, sid)
+            if ti == 0 and msg.strip():
+                await rename_session(db, sid, msg.strip()[:60])
 
     history.append({"role": "user", "content": user_display})
     history.append({"role": "assistant", "content": "⏳ Обработка…"})
@@ -213,12 +236,7 @@ async def chat_fn(message: str, file, history: list, session_id: str, token_html
         )
         yield history, sid, None, gr.update(), ""
 
-        async for agent_partial in stream_agent(
-            message,
-            session_id=sid,
-            context=task_context,
-        ):
-            agent_log = agent_partial
+        async for agent_partial in _run_agent(message, task_context):
             history = _patch_assistant(
                 history, _assistant_content(ingest_log, agent_partial)
             )
@@ -227,17 +245,26 @@ async def chat_fn(message: str, file, history: list, session_id: str, token_html
             tok_line = _fmt_tokens(tok) if tok.get("calls") else ""
             yield history, sid, None, gr.update(), tok_line
 
-        persisted = persist_text_from_agent_log(agent_log) if agent_log else "Готово."
-        async with get_db() as db:
-            ti = await next_turn_index(db, sid)
-            emb_u = await embed_single(user_display)
-            await save_chat_message(db, sid, "user", user_display, emb_u, ti)
-            emb_a = await embed_single(persisted[:4000] or " ")
-            await save_chat_message(db, sid, "assistant", persisted, emb_a, ti)
-            await touch_session(db, sid)
-            if ti == 0 and message.strip():
-                await rename_session(db, sid, message.strip()[:60])
+        await _persist(message, user_display, agent_log)
 
+        while next_msg := runner.drain():
+            history.append({"role": "user", "content": next_msg})
+            history.append({"role": "assistant", "content": "⏳ Обработка из очереди…"})
+            yield history, sid, None, gr.update(), ""
+
+            agent_log = ""
+            async for agent_partial in _run_agent(next_msg):
+                history = _patch_assistant(
+                    history, _assistant_content(ingest_log, agent_partial)
+                )
+                from app.monitoring.token_tracker import drain_cycle_tokens
+                tok = drain_cycle_tokens()
+                tok_line = _fmt_tokens(tok) if tok.get("calls") else ""
+                yield history, sid, None, gr.update(), tok_line
+
+            await _persist(next_msg, next_msg, agent_log)
+
+        async with get_db() as db:
             sessions = await list_sessions(db, limit=50)
 
         yield history, sid, None, gr.update(
@@ -293,6 +320,7 @@ def build_ui() -> gr.Blocks:
 
                 with gr.Row():
                     send_btn = gr.Button("Отправить", variant="primary")
+                    stop_btn = gr.Button("⏹ Стоп", variant="stop")
 
                 token_display = gr.Markdown(
                     value="",
@@ -300,7 +328,35 @@ def build_ui() -> gr.Blocks:
                     height=24,
                 )
 
+                queue_display = gr.Markdown(
+                    value="",
+                    visible=True,
+                    height=24,
+                )
+
         gr.Markdown(f"_{_FILE_HINT}_")
+
+        def _stop_agent(session_id: str):
+            if not session_id:
+                return "Нет активной сессии"
+            from app.agents.cancellation import AgentRunner
+            runner = AgentRunner.get(session_id)
+            if not runner.running:
+                return "Агент не выполняется"
+            runner.request_cancel()
+            return "⏹ Остановка…"
+
+        def _check_queue(session_id: str):
+            if not session_id:
+                return ""
+            from app.agents.cancellation import AgentRunner
+            runner = AgentRunner.get(session_id)
+            parts = []
+            if runner.running:
+                parts.append("🔄 Агент выполняется…")
+            if runner.queue_size():
+                parts.append(f"📋 В очереди: {runner.queue_size()}")
+            return " · ".join(parts)
 
         demo.load(init_ui, outputs=[chat_list, session_state, chatbot, token_display])
 
@@ -309,11 +365,16 @@ def build_ui() -> gr.Blocks:
 
         send_btn.click(chat_fn, chat_inputs, chat_outputs).then(
             lambda: "", outputs=msg_input
+        ).then(
+            _check_queue, inputs=[session_state], outputs=[queue_display]
         )
         msg_input.submit(chat_fn, chat_inputs, chat_outputs).then(
             lambda: "", outputs=msg_input
+        ).then(
+            _check_queue, inputs=[session_state], outputs=[queue_display]
         )
 
+        stop_btn.click(_stop_agent, inputs=[session_state], outputs=[queue_display])
         chat_list.change(switch_chat, inputs=[chat_list], outputs=[chatbot, session_state, token_display])
         new_chat_btn.click(new_chat, outputs=[chat_list, session_state, chatbot, token_display])
 

@@ -8,6 +8,7 @@ from app.api.deps import UPLOAD_DIR, _last_st
 from app.api.schemas import (
     ChatRequest,
     ChatResponse,
+    EnqueueRequest,
     GenerateModuleRequest,
     GenerateModuleResponse,
     ValidateRequest,
@@ -112,3 +113,29 @@ async def validate_code(body: ValidateRequest):
         errors=r.errors,
         warnings=r.warnings,
     )
+
+
+@router.post("/agent/cancel", summary="Остановить текущий ReAct-цикл")
+async def cancel_agent(body: EnqueueRequest):
+    from app.agents.cancellation import AgentRunner
+
+    runner = AgentRunner.get(body.session_id)
+    runner.request_cancel()
+    return {"ok": True, "cancelled": runner.running}
+
+
+@router.post("/agent/enqueue", summary="Добавить сообщение в очередь агента")
+async def enqueue_message(body: EnqueueRequest):
+    from app.agents.cancellation import AgentRunner
+
+    runner = AgentRunner.get(body.session_id)
+    runner.enqueue(body.message)
+    return {"ok": True, "queue_size": runner.queue_size()}
+
+
+@router.get("/agent/queue", summary="Размер очереди агента")
+async def get_queue_size(session_id: str = Query(...)):
+    from app.agents.cancellation import AgentRunner
+
+    runner = AgentRunner.get(session_id)
+    return {"session_id": session_id, "queue_size": runner.queue_size(), "running": runner.running}

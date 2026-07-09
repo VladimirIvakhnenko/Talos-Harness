@@ -729,6 +729,12 @@ async def stream_agent(
     skills: list[str] | None = None,
 ):
     sid = session_id or str(uuid.uuid4())
+    from app.agents.cancellation import AgentRunner
+
+    runner = AgentRunner.get(sid)
+    runner.cancel.clear()
+    runner.running = True
+
     graph = get_graph()
     steps: list[str] = []
     final_state: dict = {}
@@ -752,6 +758,11 @@ async def stream_agent(
 
             if steps:
                 yield "\n\n".join(steps)
+
+            if runner.cancel.is_set():
+                runner.cancel.clear()
+                steps.append("**⏹ Остановлено пользователем.**")
+                break
     except GraphRecursionError:
         logger.warning(
             "GraphRecursionError session=%s task_id=%s",
@@ -773,6 +784,7 @@ async def stream_agent(
 
     steps = _finalize_agent_steps(steps, all_messages, final_state)
     yield "\n\n".join(steps)
+    runner.running = False
 
 
 async def run_agent(
@@ -784,8 +796,11 @@ async def run_agent(
     skills: list[str] | None = None,
     route_skills: bool = False,
 ) -> dict:
+    from app.agents.cancellation import AgentRunner
+
     sid = session_id or str(uuid.uuid4())
     graph = get_graph()
+    runner = AgentRunner.get(sid)
 
     # If skill routing requested, auto-select skills via cosine similarity
     if route_skills and _skill_registry:
@@ -796,34 +811,33 @@ async def run_agent(
             skills = selected
             logger.info("Routed skills for benchmark: %s", selected)
 
-    initial_state = _build_initial_state(
-        user_message, sid, task_id, context, max_validation_attempts, skills=skills
-    )
-    graph_config = {"recursion_limit": _compute_recursion_limit(initial_state)}
+    async def _run_one(msg: str) -> dict:
+        state = _build_initial_state(msg, sid, task_id, context, max_validation_attempts, skills=skills)
+        cfg = {"recursion_limit": _compute_recursion_limit(state)}
+        try:
+            result = await graph.ainvoke(state, config=cfg)
+        except GraphRecursionError:
+            logger.warning("GraphRecursionError session=%s task_id=%s", sid[:8], state.get("task_id"))
+            return {
+                "session_id": sid, "task_id": state.get("task_id"),
+                "response": "Достигнут лимит итераций.",
+                "final_code": None, "matiec_ok": None,
+                "validation_attempts": 0, "generate_attempts": 0,
+                "tool_rounds": 0, "pass_at_1": False,
+                "retrieval_context": {}, "steps": 0,
+            }
+        return _agent_result_from_state(result, sid)
 
+    runner.running = True
     try:
-        result = await graph.ainvoke(initial_state, config=graph_config)
-    except GraphRecursionError:
-        logger.warning(
-            "GraphRecursionError session=%s task_id=%s",
-            sid[:8],
-            initial_state.get("task_id"),
-        )
-        return {
-            "session_id": sid,
-            "task_id": initial_state.get("task_id"),
-            "response": "Достигнут лимит итераций. Используйте stream_agent для частичного результата.",
-            "final_code": None,
-            "matiec_ok": None,
-            "validation_attempts": 0,
-            "generate_attempts": 0,
-            "tool_rounds": 0,
-            "pass_at_1": False,
-            "retrieval_context": {},
-            "steps": 0,
-        }
+        last_result = await _run_one(user_message)
 
-    return _agent_result_from_state(result, sid)
+        while next_msg := runner.drain():
+            last_result = await _run_one(next_msg)
+
+        return last_result
+    finally:
+        runner.running = False
 
 
 reset_graph()
